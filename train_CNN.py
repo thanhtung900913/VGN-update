@@ -1,6 +1,8 @@
 """
 Script huấn luyện cho vessel_segm_cnn, đã được nâng cấp lên TensorFlow 2.x
 """
+import tensorflow as tf
+tf.compat.v1.disable_eager_execution()  # Phải có dòng này để sử dụng các API tương thích với TF1.x
 import numpy as np
 import os
 import pdb
@@ -79,6 +81,24 @@ def load_pretrained_weights(model, data_path, ignore_missing=False):
             print(f"Warning: Could not load weights for {key}. Error: {e}")
             if not ignore_missing:
                 raise
+def load(data_path, session, ignore_missing=False):
+    data_dict = np.load(data_path, allow_pickle=True, encoding='latin1').item()
+    for key in data_dict:
+        with tf.compat.v1.variable_scope(key, reuse=True):
+            for subkey in data_dict[key]:
+                if subkey=='weights':
+                    target_subkey='W'
+                elif subkey=='biases':
+                    target_subkey='b'
+                try:
+                    var = tf.compat.v1.get_variable(target_subkey)
+                    session.run(var.assign(data_dict[key][subkey]))
+                    print("assign pretrain model "+subkey+ " to "+key)
+                except ValueError:
+                    print("ignore "+key+"/"+subkey)
+                    #print "ignore "+key
+                    if not ignore_missing:
+                        raise
 
 if __name__ == '__main__':
     args = parse_args()

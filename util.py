@@ -2,7 +2,7 @@
 (Đã được nâng cấp cho Python 3 và API thư viện mới)
 """
 
-
+import pickle
 import numpy as np
 # import numpy.random as npr # Đã loại bỏ, sử dụng np.random trực tiếp
 import os
@@ -76,12 +76,12 @@ class DataLayer(object):
 
         return db_inds
 
-    def _get_next_minibatch(self):
-        """Return the blobs to be used for the next minibatch."""
-        db_inds = self._get_next_minibatch_inds()
-        minibatch_db = [self._db[i] for i in db_inds]
-        return minibatch_db, get_minibatch(minibatch_db, self._is_training, \
-                                            use_padding=self._use_padding)
+    # def _get_next_minibatch(self):
+    #     """Return the blobs to be used for the next minibatch."""
+    #     db_inds = self._get_next_minibatch_inds()
+    #     minibatch_db = [self._db[i] for i in db_inds]
+    #     return minibatch_db, get_minibatch(minibatch_db, self._is_training, \
+    #                                         use_padding=self._use_padding)
 
     def forward(self):
         """Get blobs and copy them into this layer's top blob vector."""
@@ -302,7 +302,7 @@ def _get_graph_fov_blob(minibatch_db, is_training, edge_type='srns_geo_dist_bina
         len_y = 592
         len_x = 592
     elif 'STARE' in minibatch_db[0]:
-        im_root_path = '../STARE/all'
+        im_root_path = '../content/data/STARE/images'
         im_ext = '.ppm'
         label_ext = '.ah.ppm'
         fov_ext = '_mask.png'
@@ -339,8 +339,19 @@ def _get_graph_fov_blob(minibatch_db, is_training, edge_type='srns_geo_dist_bina
             fov = fov.reshape((fov.shape[0],fov.shape[1],1))
         else:
             fov = fov[:,:,[0]]
-        probmap = skimage.io.imread(cur_path+'_prob.png') # cnn results will be used for loss masking
-        probmap = probmap.reshape((probmap.shape[0],probmap.shape[1],1))
+        probmap_path = cur_path + '_prob.png'
+        if os.path.exists(probmap_path):
+            probmap = skimage.io.imread(probmap_path).astype(np.float32) / 255.0
+            if probmap.ndim == 3:
+                probmap = probmap[..., 0]
+            print(f"  Loaded probmap: {os.path.basename(probmap_path)}")
+        else:
+            # Dùng ảnh gốc để lấy kích thước
+            img = skimage.io.imread(os.path.join(im_root_path, cur_name + im_ext))
+            h, w = img.shape[:2]
+            probmap = np.ones((h, w), dtype=np.float32)
+            print(f"  No probmap: {os.path.basename(probmap_path)} → using full mask")
+        probmap = probmap.reshape((probmap.shape[0], probmap.shape[1], 1))
 
         temp = np.copy(im)
         im = np.zeros((len_y,len_x,3), dtype=temp.dtype)
@@ -360,7 +371,12 @@ def _get_graph_fov_blob(minibatch_db, is_training, edge_type='srns_geo_dist_bina
             raise NotImplementedError
         else:
             win_size_str = '_%.2d_%.2d'%(win_size,edge_geo_dist_thresh)
-            graph = nx.read_gpickle(cur_path+win_size_str+'.graph_res')
+            graph_path = cur_path + win_size_str + '.graph_res'
+            if not os.path.exists(graph_path):
+                raise FileNotFoundError(f"Graph file not found: {graph_path}")
+
+            with open(graph_path, 'rb') as f:
+                graph = pickle.load(f)
 
         union_graph = nx.convert_node_labels_to_integers(graph)
         n_nodes_in_graph = union_graph.number_of_nodes()

@@ -5,6 +5,10 @@
 # (2) place the generated graphs ('.graph_res')
 # and cnn results ('_prob.png') in
 # a new directory 'args.save_root/graph'
+# --- BẮT ĐẦU SỬA LỖI ---
+import tensorflow as tf
+tf.compat.v1.disable_eager_execution()  # ← DÙNG CÁI NÀY
+# --- KẾT THÚC SỬA LỖI ---
 import numpy as np
 import os
 import pdb
@@ -22,7 +26,7 @@ import _init_paths
 from config import cfg
 from model import VesselSegmVGN as vessel_segm_vgn
 import util
-from train_CNN import load_pretrained_weights as load
+from train_CNN import load
 
 
 def parse_args():
@@ -107,7 +111,7 @@ def restore_from_pretrained_model(sess, saver, network, pretrained_model_path):
     splits = pretrained_model_path.split('/')
     if any('DRIU*' in s for s in splits):
         var_dict = {}
-        for v in tf.trainable_variables():
+        for v in tf.compat.v1.trainable_variables():
             t_var_name = v.name
             highest_level_name = t_var_name[:t_var_name.find('/')]
             if highest_level_name in network.var_to_restore:
@@ -215,9 +219,9 @@ if __name__ == '__main__':
         train_set_txt_path = cfg.TRAIN.DRIVE_SET_TXT_PATH
         test_set_txt_path = cfg.TEST.DRIVE_SET_TXT_PATH
     elif args.dataset == 'STARE':
-        im_root_path = '../STARE/all'
-        train_set_txt_path = cfg.TRAIN.STARE_SET_TXT_PATH
-        test_set_txt_path = cfg.TEST.STARE_SET_TXT_PATH
+        im_root_path = '../content/data/STARE/images'
+        train_set_txt_path = "/content/data/STARE/list/train.txt"
+        test_set_txt_path = "/content/data/STARE/list/test.txt"
     elif args.dataset == 'CHASE_DB1':
         im_root_path = '../CHASE_DB1/all'
         train_set_txt_path = cfg.TRAIN.CHASE_DB1_SET_TXT_PATH
@@ -273,10 +277,11 @@ if __name__ == '__main__':
     config.gpu_options.allow_growth = True
     sess = tf.compat.v1.Session(config=config)
 
-    saver = tf.train.Saver(max_to_keep=100)
-    summary_writer = tf.summary.FileWriter(model_save_path, sess.graph)
+    saver = tf.compat.v1.train.Saver(max_to_keep=100)
+    summary_writer = tf.compat.v1.summary.FileWriter(model_save_path, sess.graph)
 
-    sess.run(tf.global_variables_initializer())
+    sess.run(tf.compat.v1.global_variables_initializer())
+    network = vessel_segm_vgn(args, None)
     if args.pretrained_model is not None:
         print("Loading model...")
         ext_str = args.pretrained_model[args.pretrained_model.rfind('.') + 1:]
