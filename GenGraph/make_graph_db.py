@@ -219,7 +219,7 @@ if __name__ == '__main__':
         train_set_txt_path = '/content/data/STARE/list/train.txt'
         test_set_txt_path = '/content/data/STARE/list/test.txt'
         im_root_path = '/content/data/STARE/images'
-        cnn_result_root_path = 'content/VGN-update/GenGraph'
+        cnn_result_root_path = '/content/VGN-update/GenGraph'
     elif args.dataset=='CHASE_DB1':
         train_set_txt_path = '../../CHASE_DB1/train.txt'
         test_set_txt_path = '../../CHASE_DB1/test.txt'
