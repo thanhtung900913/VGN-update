@@ -16,6 +16,7 @@ import _init_paths
 from bwmorph import bwmorph
 from config import cfg
 import util
+import pickle
 
 DEBUG = False
 
@@ -44,7 +45,8 @@ def parse_args():
     return args   
 
 
-def generate_graph_using_srns((img_name, im_root_path, cnn_result_root_path, params)):
+def generate_graph_using_srns(args_tuple):
+    img_name, im_root_path, cnn_result_root_path, params = args_tuple
          
     win_size_str = '%.2d_%.2d'%(params.win_size,params.edge_dist_thresh)
     
@@ -73,7 +75,7 @@ def generate_graph_using_srns((img_name, im_root_path, cnn_result_root_path, par
         len_x = 768
     
     cur_filename = img_name[util.find(img_name,'/')[-1]+1:]
-    print 'processing '+cur_filename
+    print ('processing '+cur_filename)
     cur_im_path = os.path.join(im_root_path, cur_filename+im_ext)
     cur_gt_mask_path = os.path.join(im_root_path, cur_filename+label_ext)
     if params.source_type=='gt': 
@@ -115,23 +117,28 @@ def generate_graph_using_srns((img_name, im_root_path, cnn_result_root_path, par
     
     max_val = []
     max_pos = []
-    for y_idx in xrange(len(y_quan)-1):
-        for x_idx in xrange(len(x_quan)-1):
-            cur_patch = vesselness[y_quan[y_idx]:y_quan[y_idx+1],x_quan[x_idx]:x_quan[x_idx+1]]
-            if np.sum(cur_patch)==0:
+    for y_idx in range(len(y_quan)-1):
+        for x_idx in range(len(x_quan)-1):
+            cur_patch = vesselness[y_quan[y_idx]:y_quan[y_idx+1], x_quan[x_idx]:x_quan[x_idx+1]]
+            if np.sum(cur_patch) == 0:
                 max_val.append(0)
-                max_pos.append((y_quan[y_idx]+cur_patch.shape[0]/2,x_quan[x_idx]+cur_patch.shape[1]/2))
+                # Dùng // để lấy trung tâm patch
+                cy = y_quan[y_idx] + cur_patch.shape[0] // 2
+                cx = x_quan[x_idx] + cur_patch.shape[1] // 2
+                max_pos.append((int(cy), int(cx)))
             else:
                 max_val.append(np.amax(cur_patch))
                 temp = np.unravel_index(cur_patch.argmax(), cur_patch.shape)
-                max_pos.append((y_quan[y_idx]+temp[0],x_quan[x_idx]+temp[1]))
+                node_y = int(y_quan[y_idx] + temp[0])
+                node_x = int(x_quan[x_idx] + temp[1])
+                max_pos.append((node_y, node_x))
     
     graph = nx.Graph()
             
     # add nodes
     for node_idx, (node_y, node_x) in enumerate(max_pos):
         graph.add_node(node_idx, kind='MP', y=node_y, x=node_x, label=node_idx)
-        print 'node label', node_idx, 'pos', (node_y,node_x), 'added'
+        print ('node label', node_idx, 'pos', (node_y,node_x), 'added')
 
     speed = vesselness
     if params.source_type=='gt':
@@ -143,10 +150,10 @@ def generate_graph_using_srns((img_name, im_root_path, cnn_result_root_path, par
     node_list = list(graph.nodes)
     for i, n in enumerate(node_list):
             
-        if speed[graph.node[n]['y'],graph.node[n]['x']]==0:
+        if speed[graph.nodes[n]['y'],graph.nodes[n]['x']]==0:
             continue
-        neighbor = speed[max(0,graph.node[n]['y']-1):min(im_y,graph.node[n]['y']+2), \
-                         max(0,graph.node[n]['x']-1):min(im_x,graph.node[n]['x']+2)]
+        neighbor = speed[max(0,graph.nodes[n]['y']-1):min(im_y,graph.nodes[n]['y']+2), \
+                         max(0,graph.nodes[n]['x']-1):min(im_x,graph.nodes[n]['x']+2)]
         
         if np.mean(neighbor)<0.1:
             continue
@@ -154,7 +161,7 @@ def generate_graph_using_srns((img_name, im_root_path, cnn_result_root_path, par
         if params.edge_method=='geo_dist':
         
             phi = np.ones_like(speed)
-            phi[graph.node[n]['y'],graph.node[n]['x']] = -1
+            phi[graph.nodes[n]['y'],graph.nodes[n]['x']] = -1
             tt = skfmm.travel_time(phi, speed, narrow=params.edge_dist_thresh) # travel time
     
             if DEBUG:
@@ -167,18 +174,18 @@ def generate_graph_using_srns((img_name, im_root_path, cnn_result_root_path, par
                 plt.close()
     
             for n_comp in node_list[i+1:]:
-                geo_dist = tt[graph.node[n_comp]['y'],graph.node[n_comp]['x']] # travel time
+                geo_dist = tt[graph.nodes[n_comp]['y'],graph.nodes[n_comp]['x']] # travel time
                 if geo_dist < params.edge_dist_thresh:
                     graph.add_edge(n, n_comp, weight=params.edge_dist_thresh/(params.edge_dist_thresh+geo_dist))
-                    print 'An edge BTWN', 'node', n, '&', n_comp, 'is constructed'
+                    print ('An edge BTWN', 'node', n, '&', n_comp, 'is constructed')
                     
         elif params.edge_method=='eu_dist':
                 
             for n_comp in node_list[i+1:]:
-                eu_dist = (graph.node[n_comp]['y']-graph.node[n]['y'])**2 + (graph.node[n_comp]['x']-graph.node[n]['x'])**2
+                eu_dist = (graph.nodes[n_comp]['y']-graph.nodes[n]['y'])**2 + (graph.nodes[n_comp]['x']-graph.nodes[n]['x'])**2
                 if eu_dist < edge_dist_thresh_sq:
                     graph.add_edge(n, n_comp, weight=1.)
-                    print 'An edge BTWN', 'node', n, '&', n_comp, 'is constructed'
+                    print ('An edge BTWN', 'node', n, '&', n_comp, 'is constructed')
                     
         else:
             raise NotImplementedError
@@ -190,7 +197,8 @@ def generate_graph_using_srns((img_name, im_root_path, cnn_result_root_path, par
                     save_graph=True, num_nodes_each_type=[0,graph.number_of_nodes()], save_path=cur_vis_res_mask_savepath)
     
     # save as files
-    nx.write_gpickle(graph, cur_res_graph_savepath, protocol=pkl.HIGHEST_PROTOCOL)
+    with open(cur_res_graph_savepath, 'wb') as f:
+        pickle.dump(graph, f, protocol=pickle.HIGHEST_PROTOCOL)
         
     graph.clear()
             
@@ -208,10 +216,10 @@ if __name__ == '__main__':
         im_root_path = '../../DRIVE/all'
         cnn_result_root_path = '../new_exp/DRIVE_cnn/test'
     elif args.dataset=='STARE':
-        train_set_txt_path = '../../STARE/train.txt'
-        test_set_txt_path = '../../STARE/test.txt'
-        im_root_path = '../../STARE/all'
-        cnn_result_root_path = '../STARE_cnn/res_resized'
+        train_set_txt_path = '/content/data/STARE/list/train.txt'
+        test_set_txt_path = '/content/data/STARE/list/test.txt'
+        im_root_path = '/content/data/STARE/images'
+        cnn_result_root_path = 'content/VGN-update/GenGraph'
     elif args.dataset=='CHASE_DB1':
         train_set_txt_path = '../../CHASE_DB1/train.txt'
         test_set_txt_path = '../../CHASE_DB1/test.txt'
@@ -232,8 +240,8 @@ if __name__ == '__main__':
     len_test = len(test_img_names)
         
     func = generate_graph_using_srns
-    func_arg_train = map(lambda x: (train_img_names[x], im_root_path, cnn_result_root_path, args), xrange(len_train))
-    func_arg_test = map(lambda x: (test_img_names[x], im_root_path, cnn_result_root_path, args), xrange(len_test))
+    func_arg_train = map(lambda x: (train_img_names[x], im_root_path, cnn_result_root_path, args), range(len_train))
+    func_arg_test = map(lambda x: (test_img_names[x], im_root_path, cnn_result_root_path, args), range(len_test))
 
     if args.use_multiprocessing:
         pool = multiprocessing.Pool(processes=20)
