@@ -50,8 +50,8 @@ if __name__ == '__main__':
         train_set_txt_path = cfg.TRAIN.DRIVE_SET_TXT_PATH
         test_set_txt_path = cfg.TEST.DRIVE_SET_TXT_PATH
     elif args.dataset == 'STARE':
-        train_set_txt_path = cfg.TRAIN.STARE_SET_TXT_PATH
-        test_set_txt_path = cfg.TEST.STARE_SET_TXT_PATH
+        train_set_txt_path = "/content/data/STARE/list/train.txt"
+        test_set_txt_path = "/content/data/STARE/list/test.txt"
     elif args.dataset == 'CHASE_DB1':
         train_set_txt_path = cfg.TRAIN.CHASE_DB1_SET_TXT_PATH
         test_set_txt_path = cfg.TEST.CHASE_DB1_SET_TXT_PATH
