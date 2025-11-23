@@ -34,7 +34,7 @@ __C.TRAIN.GRAPH_BATCH_SIZE = 1 # for VGN
 
 __C.TRAIN.DRIVE_SET_TXT_PATH = '../DRIVE/train.txt'
 
-__C.TRAIN.STARE_SET_TXT_PATH = '../STARE/train.txt'
+__C.TRAIN.STARE_SET_TXT_PATH = '/content/data/STARE/list/train.txt'
 
 __C.TRAIN.CHASE_DB1_SET_TXT_PATH = '../CHASE_DB1/train.txt'
 
@@ -81,7 +81,7 @@ __C.TEST = edict()
 
 __C.TEST.DRIVE_SET_TXT_PATH = '../DRIVE/test.txt'
 
-__C.TEST.STARE_SET_TXT_PATH = '../STARE/test.txt'
+__C.TEST.STARE_SET_TXT_PATH = '/content/data/STARE/list/test.txt'
 
 __C.TEST.CHASE_DB1_SET_TXT_PATH = '../CHASE_DB1/test.txt'
 

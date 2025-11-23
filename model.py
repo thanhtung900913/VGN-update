@@ -1,11 +1,12 @@
-""" Common model file (Migrated to TensorFlow 2.x)
+""" Common model file
 """
 
+import tensorflow as tf
+tf.compat.v1.disable_eager_execution()
 import numpy as np
-import pickle  # cPickle is 'pickle' in Python 3
+import pickle
 import pdb
 import tensorflow as tf
-from tensorflow.keras import layers, Model, optimizers, regularizers
 
 from config import cfg
 
@@ -13,18 +14,31 @@ from config import cfg
 DEBUG = False
 
 
-# Helper function for summaries is removed, as TF2 summaries are handled differently (e.g., via Callbacks or eagerly).
+def _activation_summary(x_name, x):
+    """Helper to create summaries for activations.
+
+    #Creates a summary that shows activations.
+    Creates a summary that provides a histogram of activations.
+    Creates a summary that measure the sparsity of activations.
+
+    Args:
+        x_name: Tensor name
+        x: Tensor
+    Returns:
+        nothing
+    """
+
+    tf.summary.histogram(x_name + '/activations', x)
+    tf.summary.scalar(x_name + '/sparsity', tf.nn.zero_fraction(x))
+
 
 # https://github.com/MarvinTeichmann/tensorflow-fcn/blob/master/fcn16_vgg.py
 # https://gist.github.com/akiross/754c7b87a2af8603da78b46cdaaa5598
 def get_deconv_filter(f_shape):
-    """
-    Tạo bộ lọc giải mã (deconvolution) dựa trên phép nội suy song tuyến tính (bilinear interpolation).
-    f_shape = [ksize, ksize, out_features, in_features]
-    """
+    # f_shape = [ksize, ksize, out_features, in_features]
     width = f_shape[0]
     height = f_shape[0]
-    f = np.ceil(width / 2.0)
+    f = np.ceil(width/2.0)
     c = (2 * f - 1 - f % 2) / (2.0 * f)
     bilinear = np.zeros([f_shape[0], f_shape[1]])
     for x in range(width):
@@ -34,1130 +48,1192 @@ def get_deconv_filter(f_shape):
     weights = np.zeros(f_shape)
     for i in range(f_shape[2]):
         weights[:, :, i, i] = bilinear
-
+        
     return weights
 
 
 def add_tensors_wo_none(tensor_list):
-    """Cộng tất cả các tensor trong danh sách, bỏ qua các giá trị None."""
-    temp_list = [t for t in tensor_list if t is not None]
+    # Adds all input tensors element-wise while filtering out none tensors.
+    # print tensor_list
+    temp_list = list(filter(lambda x: (x is not None), tensor_list))
     if len(temp_list):
         return tf.add_n(temp_list)
     else:
         return None
+     
 
-
-class BaseModel(tf.keras.Model):
+class base_model():
     def __init__(self, weight_file_path):
-        super(BaseModel, self).__init__()
 
         if weight_file_path is not None:
-            print(f"Loading pretrained weights from: {weight_file_path}")
-            with open(weight_file_path, 'rb') as f: # Use 'rb' for pickle
-                self.pretrained_weights = pickle.load(f, encoding='latin1') # Add encoding for Py3
-        else:
-            self.pretrained_weights = None
+            with open(weight_file_path, 'rb') as f:
+                self.pretrained_weights = pickle.load(f)       
+    
+    def new_conv_layer(self, bottom, filter_shape, stride=[1,1,1,1], init=tf.random_normal_initializer(0., 0.01), \
+                       norm_type=None, use_relu=False, is_training=True, name=None):
+        
+        with tf.compat.v1.variable_scope(name) as scope:
+            w = tf.compat.v1.get_variable(
+                    "W",
+                    shape=filter_shape,
+                    initializer=init)
+            out = tf.nn.conv2d(bottom, w, stride, padding='SAME')
+            
+            if norm_type=='BN':
+                out = tf.compat.v1.layers.batch_normalization(out, training=is_training, renorm=cfg.USE_BRN)
+            elif norm_type=='GN':
+                out = self.group_norm(out, num_group=min(cfg.GN_MIN_NUM_G, filter_shape[-1]/cfg.GN_MIN_CHS_PER_G))
+            else:
+                b = tf.compat.v1.get_variable(
+                    "b",
+                    shape=filter_shape[-1],
+                    initializer=tf.compat.v1.constant_initializer(0.))
+                out = tf.nn.bias_add(out, b)
 
-    # new_conv_layer, new_fc_layer, new_deconv_layer are removed.
-    # We will use tf.keras.layers directly in the model definitions.
+            if use_relu:
+                out = tf.nn.relu(out)
 
-    # group_norm functions are removed. We will use tf.keras.layers.GroupNormalization.
+        return out
+    
+    def new_fc_layer(self, bottom, input_size, output_size, init=tf.random_normal_initializer(0., 0.01), \
+                     norm_type=None, use_relu=False, is_training=True, name=None):
+        shape = bottom.get_shape().as_list()
+        dim = np.prod(shape[1:])
+        x = tf.reshape(bottom, [-1,dim])
+
+        with tf.compat.v1.variable_scope(name) as scope:
+            w = tf.compat.v1.get_variable(
+                    "W",
+                    shape=[input_size, output_size],
+                    initializer=init)
+            out = tf.matmul(x, w)
+            
+            if norm_type=='BN':
+                out = tf.compat.v1.layers.batch_normalization(out, training=is_training, renorm=cfg.USE_BRN)
+            elif norm_type=='GN':
+                out = self.group_norm(out, num_group=min(cfg.GN_MIN_NUM_G, output_size/cfg.GN_MIN_CHS_PER_G))
+            else:
+                b = tf.compat.v1.get_variable(
+                    "b",
+                    shape=[output_size],
+                    initializer=tf.compat.v1.constant_initializer(0.))
+                out = out+b
+                
+            if use_relu:
+                out = tf.nn.relu(out)
+
+        return out
+    
+    def new_deconv_layer(self, bottom, filter_shape, output_shape, strides, norm_type=None, use_relu=False, is_training=True, name=None):
+        weights = get_deconv_filter(filter_shape)       
+        
+        with tf.compat.v1.variable_scope(name) as scope:
+            w = tf.compat.v1.get_variable(
+                    "W",
+                    shape=weights.shape,
+                    initializer=tf.compat.v1.constant_initializer(value=weights,dtype=tf.float32))
+
+            out = tf.nn.conv2d_transpose(bottom, w, output_shape, strides, padding='SAME')
+            
+            if DEBUG:
+                out = tf.Print(out, [tf.shape(out)],
+                               message='Shape of %s' % name,
+                               summarize=4, first_n=1)
+                
+            if norm_type=='BN':
+                out = tf.compat.v1.layers.batch_normalization(out, training=is_training, renorm=cfg.USE_BRN)
+            elif norm_type=='GN':
+                out = self.group_norm(out, num_group=min(cfg.GN_MIN_NUM_G, filter_shape[-2]/cfg.GN_MIN_CHS_PER_G))
+            else:
+                b = tf.compat.v1.get_variable(
+                    "b",
+                    shape=weights.shape[-2],
+                    initializer=tf.compat.v1.constant_initializer(0.))
+                out = tf.nn.bias_add(out, b)
+
+            if use_relu:
+                out = tf.nn.relu(out)    
+
+        return out
 
     # https://github.com/ppwwyyxx/tensorpack/blob/master/tensorpack/models/pool.py
-    # https://github.com/tensorflow/tensorflow/issues/2169
+    # https://github.com/tensorflow/tensorflow/issues/2169        
     def unpool(self, pool, ind, ksize, name):
         """
-        Lớp Unpooling sau max_pool_with_argmax.
-        (Lưu ý: Mã này dường như không được sử dụng trong các mô hình bên dưới,
-         nhưng vẫn được di chuyển sang TF2)
+        Unpooling layer after max_pool_with_argmax.
         Args :
-            pool : tensor đầu ra đã max pooled
-            ind : chỉ số argmax
-            ksize : ksize giống như ksize của pool
+            pool : max pooled output tensor
+            ind : argmax indices
+            ksize : ksize is the same as for the pool
         Return :
-            ret : tensor đã unpooled
+            ret : unpooled tensor
         """
-        with tf.name_scope(name):
-            input_shape = tf.shape(pool)
-            output_shape = [input_shape[0], input_shape[1] * ksize[1], input_shape[2] * ksize[2], input_shape[3]]
-
-            flat_input_size = tf.math.cumprod(input_shape)[-1]
-            flat_output_shape = tf.stack([output_shape[0], output_shape[1] * output_shape[2] * output_shape[3]])
-
+        with tf.compat.v1.variable_scope(name) as scope:
+            input_shape =  tf.shape(pool)
+            output_shape = [input_shape[0], input_shape[1]*ksize[1], input_shape[2]*ksize[2], input_shape[3]]
+    
+            flat_input_size = tf.cumprod(input_shape)[-1]
+            flat_output_shape = tf.stack([output_shape[0], output_shape[1]*output_shape[2]*output_shape[3]])
+    
             pool_ = tf.reshape(pool, tf.stack([flat_input_size]))
-            batch_range = tf.reshape(tf.range(tf.cast(output_shape[0], tf.int64), dtype=ind.dtype),
-                                     tf.stack([input_shape[0], 1, 1, 1]))
-            b = tf.ones_like(ind) * batch_range
+            batch_range = tf.reshape(tf.range(tf.cast(output_shape[0], tf.int64), dtype=ind.dtype), 
+                                              shape=tf.stack([input_shape[0], 1, 1, 1]))
+            b = tf.ones_like(ind)*batch_range
             b = tf.reshape(b, tf.stack([flat_input_size, 1]))
             ind_ = tf.reshape(ind, tf.stack([flat_input_size, 1]))
             ind_ = tf.concat([b, ind_], 1)
-
+    
             ret = tf.scatter_nd(ind_, pool_, shape=tf.cast(flat_output_shape, tf.int64))
             ret = tf.reshape(ret, tf.stack(output_shape))
+        
+        return ret
+    
+    def group_norm(self, input, num_group=32, epsilon=1e-05):
+        # We here assume the channel-last ordering (NHWC)
+        
+        num_ch = input.get_shape().as_list()[-1]
+        num_group = min(num_group, num_ch)
+        
+        NHWCG = tf.concat([tf.slice(tf.shape(input),[0],[3]), tf.constant([num_ch//num_group, num_group])], axis=0)
+        output = tf.reshape(input, NHWCG)
+        
+        mean, var = tf.nn.moments(output, [1, 2, 3], keep_dims=True)
+        output = (output - mean) / tf.sqrt(var + epsilon)
+        
+        # gamma and beta
+        gamma = tf.compat.v1.get_variable('gamma', [1, 1, 1, num_ch], initializer=tf.compat.v1.constant_initializer(1.0))
+        beta = tf.compat.v1.get_variable('beta', [1, 1, 1, num_ch], initializer=tf.compat.v1.constant_initializer(0.0))
+    
+        output = tf.reshape(output, tf.shape(input)) * gamma + beta
+        
+        return output
+    
+    def group_norm_fc(self, input, num_group=32, epsilon=1e-05):
+        # We here assume the channel-last ordering (NHWC)
+        
+        num_ch = input.get_shape().as_list()[-1]
+        num_group = min(num_group, num_ch)
+        
+        NCG = tf.concat([tf.slice(tf.shape(input),[0],[1]), tf.constant([num_ch//num_group, num_group])], axis=0)
+        output = tf.reshape(input, NCG)
+        
+        mean, var = tf.nn.moments(output, [1], keep_dims=True)
+        output = (output - mean) / tf.sqrt(var + epsilon)
+        
+        # gamma and beta
+        gamma = tf.compat.v1.get_variable('gamma', [1, num_ch], initializer=tf.compat.v1.constant_initializer(1.0))
+        beta = tf.compat.v1.get_variable('beta', [1, num_ch], initializer=tf.compat.v1.constant_initializer(0.0))
+    
+        output = tf.reshape(output, tf.shape(input)) * gamma + beta
+        
+        return output
+    
+    def group_norm_layer(self, input, num_group=32, epsilon=1e-05, name=None):
+        # We here assume the channel-last ordering (NHWC)
+        
+        with tf.compat.v1.variable_scope(name) as scope:
+        
+            num_ch = input.get_shape().as_list()[-1]
+            num_group = min(num_group, num_ch)
+            
+            NHWCG = tf.concat([tf.slice(tf.shape(input),[0],[3]), tf.constant([num_ch//num_group, num_group])], axis=0)
+            output = tf.reshape(input, NHWCG)
+            
+            mean, var = tf.nn.moments(output, [1, 2, 3], keep_dims=True)
+            output = (output - mean) / tf.sqrt(var + epsilon)
+            
+            # gamma and beta
+            gamma = tf.compat.v1.get_variable('gamma', [1, 1, 1, num_ch], initializer=tf.compat.v1.constant_initializer(1.0))
+            beta = tf.compat.v1.get_variable('beta', [1, 1, 1, num_ch], initializer=tf.compat.v1.constant_initializer(0.0))
+        
+            output = tf.reshape(output, tf.shape(input)) * gamma + beta
+        
+        return output
 
-            return ret
 
-    def _get_norm_layer(self, norm_type, num_channels):
-        """Helper để tạo lớp chuẩn hóa."""
-        if norm_type == 'BN':
-            return layers.BatchNormalization(renorm=cfg.USE_BRN)
-        elif norm_type == 'GN':
-            num_groups = min(cfg.GN_MIN_NUM_G, num_channels // cfg.GN_MIN_CHS_PER_G)
-            return layers.GroupNormalization(groups=num_groups)
-        else:
-            return None # Sẽ sử dụng bias
-
-    def _get_regularizer(self):
-        """Helper để lấy kernel regularizer."""
-        return regularizers.l2(cfg.TRAIN.WEIGHT_DECAY_RATE)
-
-
-class vessel_segm_cnn(BaseModel):
+class vessel_segm_cnn(base_model):
     def __init__(self, params, weight_file_path):
-        super(vessel_segm_cnn, self).__init__(weight_file_path)
+        base_model.__init__(self, weight_file_path)
         self.params = params
         self.cnn_model = params.cnn_model
-
-        if self.cnn_model not in ['driu', 'driu_large']:
-            raise NotImplementedError(f"CNN model {self.cnn_model} not implemented.")
-
-        self.num_spe_channels = 16 # fixed
-
-        # Tạo tất cả các lớp (layers)
-        self._build_model_layers()
-
-        # Tạo bộ tối ưu hóa (optimizer)
-        self._build_optimizer()
-
-    def _build_optimizer(self):
-        """Xây dựng bộ tối ưu hóa và lịch trình học."""
-
-        if self.params.lr_decay == 'const':
-            self.lr_schedule = self.params.lr
-        elif self.params.lr_decay == 'pc':
-            boundaries = [int(self.params.max_iters * 0.5), int(self.params.max_iters * 0.75)]
-            values = [self.params.lr, self.params.lr * 0.5, self.params.lr * 0.25]
-            self.lr_schedule = optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
-        elif self.params.lr_decay == 'exp':
-            self.lr_schedule = optimizers.schedules.ExponentialDecay(
-                self.params.lr,
-                decay_steps=self.params.max_iters / 20,
-                decay_rate=0.9,
-                staircase=False
-            )
+        self.global_step = tf.Variable(0, name='global_step', trainable=False)
+        self.build_model()
+        
+    def build_model(self):
+        """Build the model."""
+        print("Building the model...")
+        if self.cnn_model=='driu':
+            self.build_driu()
+        elif self.cnn_model=='driu_large':
+            self.build_driu_large()
         else:
-            raise NotImplementedError(f"LR decay {self.params.lr_decay} not implemented.")
+            pass
+        print("Model built.")
+        
+    def build_driu(self):
 
-        if self.params.opt == 'adam':
-            self.optimizer = optimizers.Adam(learning_rate=self.lr_schedule, epsilon=0.1)
-        elif self.params.opt == 'sgd':
-            self.optimizer = optimizers.SGD(
-                learning_rate=self.lr_schedule,
-                momentum=cfg.TRAIN.MOMENTUM,
-                nesterov=True
-            )
-        else:
-            raise NotImplementedError(f"Optimizer {self.params.opt} not implemented.")
+        imgs = tf.compat.v1.placeholder(tf.float32, [None, None, None, 3], name='imgs')
+        labels = tf.compat.v1.placeholder(tf.int64, [None, None, None, 1], name='labels')
+        fov_masks = tf.compat.v1.placeholder(tf.int64, [None, None, None, 1], name='fov_masks')
 
-        # Biến global_step được quản lý tự động bởi optimizer
+        is_training = tf.compat.v1.placeholder(tf.bool, [])
 
-    def _build_model_layers(self):
-        """Định nghĩa tất cả các lớp Keras cho mô hình."""
-        reg = self._get_regularizer()
+        conv1_1 = self.new_conv_layer(imgs, [3,3,3,64], use_relu=True, name='conv1_1')
+        _activation_summary('conv1_1', conv1_1)
+        conv1_2 = self.new_conv_layer(conv1_1, [3,3,64,64], use_relu=True, name='conv1_2')
+        _activation_summary('conv1_2', conv1_2)
+        pool1 = tf.nn.max_pool(conv1_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool1')
+                               
+        conv2_1 = self.new_conv_layer(pool1, [3,3,64,128], use_relu=True, name='conv2_1')
+        _activation_summary('conv2_1', conv2_1)
+        conv2_2 = self.new_conv_layer(conv2_1, [3,3,128,128], use_relu=True, name='conv2_2')
+        _activation_summary('conv2_2', conv2_2)
+        pool2 = tf.nn.max_pool(conv2_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool2')                               
+                               
+        conv3_1 = self.new_conv_layer(pool2, [3,3,128,256], use_relu=True, name='conv3_1')
+        _activation_summary('conv3_1', conv3_1)
+        conv3_2 = self.new_conv_layer(conv3_1, [3,3,256,256], use_relu=True, name='conv3_2')
+        _activation_summary('conv3_2', conv3_2)
+        conv3_3 = self.new_conv_layer(conv3_2, [3,3,256,256], use_relu=True, name='conv3_3')
+        _activation_summary('conv3_3', conv3_3)
+        pool3 = tf.nn.max_pool(conv3_3, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool3')
+                               
+        conv4_1 = self.new_conv_layer(pool3, [3,3,256,512], use_relu=True, name='conv4_1')
+        _activation_summary('conv4_1', conv4_1)
+        conv4_2 = self.new_conv_layer(conv4_1, [3,3,512,512], use_relu=True, name='conv4_2')
+        _activation_summary('conv4_2', conv4_2)
+        conv4_3 = self.new_conv_layer(conv4_2, [3,3,512,512], use_relu=True, name='conv4_3')
+        _activation_summary('conv4_3', conv4_3)
 
-        # VGG-style backbone
-        self.conv1_1 = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv1_1')
-        self.conv1_2 = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv1_2')
-        self.pool1 = layers.MaxPool2D(2, strides=2, padding='same', name='pool1')
+        # specialized layers        
+        num_ch = 16 # fixed
+        
+        target_shape = tf.concat(values=[tf.slice(tf.shape(imgs), [0], [3]),tf.constant(num_ch,shape=[1,])], axis=0)  
+        spe_1 = self.new_conv_layer(conv1_2, [3,3,64,num_ch], use_relu=True, name='spe_1')
+        _activation_summary('spe_1', spe_1)
+        spe_2 = self.new_conv_layer(conv2_2, [3,3,128,num_ch], use_relu=True, name='spe_2')
+        _activation_summary('spe_2', spe_2)
+        resized_spe_2 = self.new_deconv_layer(spe_2, [4,4,num_ch,num_ch], target_shape, [1,2,2,1], use_relu=True, name='resized_spe_2') 
+        spe_3 = self.new_conv_layer(conv3_3, [3,3,256,num_ch], use_relu=True, name='spe_3')
+        _activation_summary('spe_3', spe_3)
+        resized_spe_3 = self.new_deconv_layer(spe_3, [8,8,num_ch,num_ch], target_shape, [1,4,4,1], use_relu=True, name='resized_spe_3')
+        spe_4 = self.new_conv_layer(conv4_3, [3,3,512,num_ch], use_relu=True, name='spe_4')
+        _activation_summary('spe_4', spe_4)
+        resized_spe_4 = self.new_deconv_layer(spe_4, [16,16,num_ch,num_ch], target_shape, [1,8,8,1], use_relu=True, name='resized_spe_4')  
+        spe_concat = tf.concat(values=[spe_1,resized_spe_2,resized_spe_3,resized_spe_4], axis=3)
 
-        self.conv2_1 = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv2_1')
-        self.conv2_2 = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv2_2')
-        self.pool2 = layers.MaxPool2D(2, strides=2, padding='same', name='pool2')
-
-        self.conv3_1 = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv3_1')
-        self.conv3_2 = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv3_2')
-        self.conv3_3 = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv3_3')
-        self.pool3 = layers.MaxPool2D(2, strides=2, padding='same', name='pool3')
-
-        self.conv4_1 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv4_1')
-        self.conv4_2 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv4_2')
-        self.conv4_3 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv4_3')
-
-        # Lớp chuyên biệt (Specialized layers)
-        n = self.num_spe_channels
-        self.spe_1 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_1')
-        self.spe_2 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_2')
-        self.spe_3 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_3')
-        self.spe_4 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_4')
-
-        # Lớp giải mã (Deconv layers) với khởi tạo song tuyến tính
-        init_2 = tf.keras.initializers.Constant(get_deconv_filter([4, 4, n, n]))
-        self.resized_spe_2 = layers.Conv2DTranspose(n, 4, strides=2, padding='same', activation='relu', kernel_initializer=init_2, kernel_regularizer=reg, name='resized_spe_2')
-
-        init_4 = tf.keras.initializers.Constant(get_deconv_filter([8, 8, n, n]))
-        self.resized_spe_3 = layers.Conv2DTranspose(n, 8, strides=4, padding='same', activation='relu', kernel_initializer=init_4, kernel_regularizer=reg, name='resized_spe_3')
-
-        init_8 = tf.keras.initializers.Constant(get_deconv_filter([16, 16, n, n]))
-        self.resized_spe_4 = layers.Conv2DTranspose(n, 16, strides=8, padding='same', activation='relu', kernel_initializer=init_8, kernel_regularizer=reg, name='resized_spe_4')
-
-        if self.cnn_model == 'driu_large':
-            self.pool4 = layers.MaxPool2D(2, strides=2, padding='same', name='pool4')
-            self.conv5_1 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv5_1')
-            self.conv5_2 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv5_2')
-            self.conv5_3 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv5_3')
-            self.spe_5 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_5')
-
-            init_16 = tf.keras.initializers.Constant(get_deconv_filter([32, 32, n, n]))
-            self.resized_spe_5 = layers.Conv2DTranspose(n, 32, strides=16, padding='same', activation='relu', kernel_initializer=init_16, kernel_regularizer=reg, name='resized_spe_5')
-
-            self.output_layer = layers.Conv2D(1, 1, padding='same', kernel_regularizer=reg, name='output')
-        else: # 'driu'
-            self.output_layer = layers.Conv2D(1, 1, padding='same', kernel_regularizer=reg, name='output')
-
-    def call(self, imgs, training=True):
-        """Thực hiện lượt chạy thuận (forward pass)."""
-
-        # Backbone
-        x = self.conv1_1(imgs)
-        conv1_2 = self.conv1_2(x)
-        x = self.pool1(conv1_2)
-
-        x = self.conv2_1(x)
-        conv2_2 = self.conv2_2(x)
-        x = self.pool2(conv2_2)
-
-        x = self.conv3_1(x)
-        x = self.conv3_2(x)
-        conv3_3 = self.conv3_3(x)
-        x = self.pool3(conv3_3)
-
-        x = self.conv4_1(x)
-        x = self.conv4_2(x)
-        conv4_3 = self.conv4_3(x)
-
-        # Specialized layers
-        spe_1 = self.spe_1(conv1_2)
-        spe_2 = self.spe_2(conv2_2)
-        spe_3 = self.spe_3(conv3_3)
-        spe_4 = self.spe_4(conv4_3)
-
-        rspe_2 = self.resized_spe_2(spe_2)
-        rspe_3 = self.resized_spe_3(spe_3)
-        rspe_4 = self.resized_spe_4(spe_4)
-
-
-        spe_layers = [spe_1, rspe_2, rspe_3, rspe_4]
-
-        if self.cnn_model == 'driu_large':
-            x = self.pool4(conv4_3)
-            x = self.conv5_1(x)
-            x = self.conv5_2(x)
-            conv5_3 = self.conv5_3(x)
-            spe_5 = self.spe_5(conv5_3)
-            rspe_5 = self.resized_spe_5(spe_5)
-            spe_layers.append(rspe_5)
-
-        spe_concat = tf.concat(values=spe_layers, axis=3)
-        self.conv_feats = spe_concat # Lưu lại để tham chiếu nếu cần
-
-        output = self.output_layer(spe_concat)
+        output = self.new_conv_layer(spe_concat, [1,1,num_ch*4,1], name='output')
+        _activation_summary('output', output)
+        
         fg_prob = tf.sigmoid(output)
 
-        return output, fg_prob
-
-    def compute_metrics(self, output, fg_prob, labels):
-        """Tính toán các chỉ số (accuracy, precision, recall)."""
+        ### Compute the loss ###
+        binary_mask_fg = tf.compat.v1.to_float(tf.equal(labels, 1))
+        binary_mask_bg = tf.compat.v1.to_float(tf.not_equal(labels, 1))
+        combined_mask = tf.concat(values=[binary_mask_bg,binary_mask_fg], axis=3)
+        flat_one_hot_labels = tf.reshape(tensor=combined_mask, shape=(-1, 2))
         flat_labels = tf.reshape(tensor=labels, shape=(-1,))
-        flat_bin_output = tf.greater_equal(tf.reshape(tensor=fg_prob, shape=(-1,)), 0.5)
-
-        flat_labels_bool = tf.cast(flat_labels, tf.bool)
-
-        # Accuracy
-        correct = tf.cast(tf.equal(flat_bin_output, flat_labels_bool), tf.float32)
-        accuracy = tf.reduce_mean(correct)
-
-        # Precision, Recall
-        num_fg_output = tf.reduce_sum(tf.cast(flat_bin_output, tf.float32))
-        binary_mask_fg = tf.cast(tf.equal(labels, 1), tf.float32)
-        num_pixel_fg = tf.cast(tf.math.count_nonzero(binary_mask_fg, dtype=tf.int64), tf.float32)
-
-        tp = tf.reduce_sum(tf.cast(tf.logical_and(flat_labels_bool, flat_bin_output), tf.float32))
-
-        pre = tf.divide(tp, tf.add(num_fg_output, cfg.EPSILON))
-        rec = tf.divide(tp, tf.add(num_pixel_fg, cfg.EPSILON))
-
-        metrics = {
-            'accuracy': accuracy,
-            'precision': pre,
-            'recall': rec,
-            'tp': tp,
-            'num_fg_output': num_fg_output,
-            'num_pixel_fg': num_pixel_fg
-        }
-        return metrics
-
-    def compute_loss_fn(self, output, labels, fov_masks):
-        """Tính toán hàm mất mát."""
-        flat_labels = tf.reshape(tensor=labels, shape=(-1,))
-        flat_logits = tf.reshape(tensor=output, shape=(-1,))
-
-        cross_entropies = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=flat_logits,
-            labels=tf.cast(flat_labels, tf.float32)
-        )
+        flat_logits = tf.reshape(tensor=output, shape=(-1,))        
+        cross_entropies = tf.nn.sigmoid_cross_entropy_with_logits(logits=flat_logits, labels=tf.compat.v1.to_float(flat_labels))
+        
+        """# weighted cross entropy loss (in/out fov)
+        num_pixel = tf.size(labels)
+        num_pixel_fg = tf.compat.v1.count_nonzero(binary_mask_fg, dtype=tf.int32)
+        num_pixel_bg = num_pixel - num_pixel_fg
+        class_weight = tf.cast(tf.concat(values=[tf.reshape(tf.divide(num_pixel_fg,num_pixel),(1,1)), \
+                                                tf.reshape(tf.divide(num_pixel_bg,num_pixel),(1,1))], axis=1), dtype=tf.float32)
+        weight_per_label = tf.transpose(tf.matmul(flat_one_hot_labels,tf.transpose(class_weight))) #shape [1, TRAIN.BATCH_SIZE]
+        # this is the weight for each datapoint, depending on its label
+        loss = tf.reduce_mean(tf.multiply(weight_per_label,cross_entropies))"""
 
         # weighted cross entropy loss (in fov)
-        binary_mask_fg = tf.cast(tf.equal(labels, 1), tf.float32)
-        binary_mask_bg = tf.cast(tf.not_equal(labels, 1), tf.float32)
-        combined_mask = tf.concat(values=[binary_mask_bg, binary_mask_fg], axis=3)
-        flat_one_hot_labels = tf.reshape(tensor=combined_mask, shape=(-1, 2))
-
-        num_pixel_in_fov = tf.reduce_sum(fov_masks)
-        num_pixel_fg = tf.cast(tf.math.count_nonzero(binary_mask_fg, dtype=tf.int64), tf.float32)
-        num_pixel_bg = tf.cast(num_pixel_in_fov, tf.float32) - num_pixel_fg
-
-        # Tránh chia cho 0 nếu num_pixel_in_fov là 0
-        safe_num_pixel_in_fov = tf.add(tf.cast(num_pixel_in_fov, tf.float32), cfg.EPSILON)
-
-        weight_fg = tf.divide(num_pixel_bg, safe_num_pixel_in_fov)
-        weight_bg = tf.divide(num_pixel_fg, safe_num_pixel_in_fov)
-
-        class_weight = tf.cast(tf.stack([weight_bg, weight_fg]), dtype=tf.float32)
-        weight_per_label = tf.reduce_sum(flat_one_hot_labels * class_weight, axis=1)
-
-        # Áp dụng fov_masks
+        num_pixel = tf.reduce_sum(fov_masks)
+        num_pixel_fg = tf.compat.v1.count_nonzero(binary_mask_fg, dtype=tf.int64)
+        num_pixel_bg = num_pixel - num_pixel_fg
+        class_weight = tf.cast(tf.concat(values=[tf.reshape(tf.divide(num_pixel_fg,num_pixel),(1,1)), \
+                                                tf.reshape(tf.divide(num_pixel_bg,num_pixel),(1,1))], axis=1), dtype=tf.float32)
+        weight_per_label = tf.transpose(tf.matmul(flat_one_hot_labels,tf.transpose(class_weight))) #shape [1, TRAIN.BATCH_SIZE]
+        # this is the weight for each datapoint, depending on its label
         reshaped_fov_masks = tf.reshape(tensor=tf.cast(fov_masks, tf.float32), shape=(-1,))
-        safe_mean_fov = tf.add(tf.reduce_mean(reshaped_fov_masks), cfg.EPSILON)
-        reshaped_fov_masks_norm = reshaped_fov_masks / safe_mean_fov
+        reshaped_fov_masks /= tf.reduce_mean(reshaped_fov_masks)
+        loss = tf.reduce_mean(tf.multiply(tf.multiply(reshaped_fov_masks, weight_per_label), cross_entropies))
+         
+        weights_only = filter( lambda x: x.name.endswith('W:0'), tf.compat.v1.trainable_variables() )
+        weight_decay = tf.reduce_sum(tf.stack([tf.nn.l2_loss(x) for x in weights_only])) * cfg.TRAIN.WEIGHT_DECAY_RATE
+        loss += weight_decay
+        
+        ### Compute the accuracy ###
+        flat_bin_output = tf.greater_equal(tf.reshape(tensor=fg_prob, shape=(-1,)), 0.5)
+        # accuracy
+        correct = tf.compat.v1.to_float(tf.equal(flat_bin_output,tf.cast(flat_labels, tf.bool)))
+        accuracy = tf.reduce_mean(correct)
+        # precision, recall
+        num_fg_output = tf.reduce_sum(tf.compat.v1.to_float(flat_bin_output))
+        tp = tf.reduce_sum(tf.compat.v1.to_float(tf.logical_and(tf.cast(flat_labels, dtype=tf.bool), flat_bin_output)))
+        pre = tf.divide(tp,tf.add(num_fg_output,cfg.EPSILON))
+        rec = tf.divide(tp,tf.compat.v1.to_float(num_pixel_fg))
+        
+        ### Build the solver ###
+        if self.params.opt=='adam':
+            train_op = tf.compat.v1.train.AdamOptimizer(self.params.lr, epsilon=0.1).minimize(loss, global_step=self.global_step)
+        elif self.params.opt=='sgd':
+            if self.params.lr_decay=='const':
+                # constant
+                optimizer = tf.compat.v1.train.MomentumOptimizer(self.params.lr, cfg.TRAIN.MOMENTUM, use_nesterov=True)
+                grads_and_vars = optimizer.compute_gradients(loss)
+                grads_and_vars = map(lambda gv: (0.01*gv[0],gv[1]) if 'output' in gv[1].name else (gv[0],gv[1]), grads_and_vars)
+                grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = [(tf.clip_by_value(gv[0], -5., 5.), gv[1]) for gv in grads_and_vars]
+                train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)
+            elif self.params.lr_decay=='pc':
+                # piecewise_constant
+                boundaries = [int(self.params.max_iters*0.5),int(self.params.max_iters*0.75)]
+                values = [self.params.lr,self.params.lr*0.5,self.params.lr*0.25]
+                learning_rate = tf.compat.v1.train.piecewise_constant(self.global_step, boundaries, values)
+                #train_op = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True).minimize(loss, global_step=self.global_step)
+                optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True)
+                grads_and_vars = optimizer.compute_gradients(loss)
+                grads_and_vars = map(lambda gv: (0.01*gv[0],gv[1]) if 'output' in gv[1].name else (gv[0],gv[1]), grads_and_vars)
+                grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = [(tf.clip_by_value(gv[0], -5., 5.), gv[1]) for gv in grads_and_vars]
+                train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)
+            elif self.params.lr_decay=='exp':
+                # exponential_decay
+                learning_rate = tf.compat.v1.train.exponential_decay(self.params.lr, self.global_step, self.params.max_iters/20, 0.9, staircase=False)
+                #train_op = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True).minimize(loss, global_step=self.global_step)   
+                optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True)
+                grads_and_vars = optimizer.compute_gradients(loss)
+                grads_and_vars = [(tf.clip_by_value(gv[0], -5., 5.), gv[1]) for gv in grads_and_vars]
+                train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)
 
-        weighted_loss = tf.multiply(reshaped_fov_masks_norm, weight_per_label)
-        loss = tf.reduce_mean(tf.multiply(weighted_loss, cross_entropies))
+        ### Hang up the results ###
+        self.imgs = imgs
+        self.labels = labels
+        self.fov_masks = fov_masks
+        self.is_training = is_training
+        
+        self.conv_feats = spe_concat
+        self.output = output
+        self.fg_prob = fg_prob
+        
+        self.flat_bin_output = flat_bin_output
+        self.tp = tp
+        self.num_fg_output = num_fg_output
+        self.num_pixel_fg = num_pixel_fg        
+        
+        self.accuracy = accuracy
+        self.precision = pre        
+        self.recall = rec
+        
+        self.loss = loss
+        self.train_op = train_op
 
-        # Thêm L2 regularization loss (Keras tự động thu thập)
-        total_loss = loss + tf.add_n(self.losses)
+        
+    def build_driu_large(self):
 
-        return total_loss
+        imgs = tf.compat.v1.placeholder(tf.float32, [None, None, None, 3], name='imgs')
+        labels = tf.compat.v1.placeholder(tf.int64, [None, None, None, 1], name='labels')
+        is_training = tf.compat.v1.placeholder(tf.bool, [])
 
-    def _process_gradients(self, grads_and_vars):
-        """Áp dụng logic xử lý gradient tùy chỉnh từ mã TF1.x."""
-        processed_gvs = []
-        for g, v in grads_and_vars:
-            if g is None:
-                processed_gvs.append((g, v))
-                continue
+        conv1_1 = self.new_conv_layer(imgs, [3,3,3,64], use_relu=True, name='conv1_1')
+        _activation_summary('conv1_1', conv1_1)
+        conv1_2 = self.new_conv_layer(conv1_1, [3,3,64,64], use_relu=True, name='conv1_2')
+        _activation_summary('conv1_2', conv1_2)
+        pool1 = tf.nn.max_pool(conv1_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool1')
+                               
+        conv2_1 = self.new_conv_layer(pool1, [3,3,64,128], use_relu=True, name='conv2_1')
+        _activation_summary('conv2_1', conv2_1)
+        conv2_2 = self.new_conv_layer(conv2_1, [3,3,128,128], use_relu=True, name='conv2_2')
+        _activation_summary('conv2_2', conv2_2)
+        pool2 = tf.nn.max_pool(conv2_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool2')                               
+                               
+        conv3_1 = self.new_conv_layer(pool2, [3,3,128,256], use_relu=True, name='conv3_1')
+        _activation_summary('conv3_1', conv3_1)
+        conv3_2 = self.new_conv_layer(conv3_1, [3,3,256,256], use_relu=True, name='conv3_2')
+        _activation_summary('conv3_2', conv3_2)
+        conv3_3 = self.new_conv_layer(conv3_2, [3,3,256,256], use_relu=True, name='conv3_3')
+        _activation_summary('conv3_3', conv3_3)
+        pool3 = tf.nn.max_pool(conv3_3, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool3')
+                               
+        conv4_1 = self.new_conv_layer(pool3, [3,3,256,512], use_relu=True, name='conv4_1')
+        _activation_summary('conv4_1', conv4_1)
+        conv4_2 = self.new_conv_layer(conv4_1, [3,3,512,512], use_relu=True, name='conv4_2')
+        _activation_summary('conv4_2', conv4_2)
+        conv4_3 = self.new_conv_layer(conv4_2, [3,3,512,512], use_relu=True, name='conv4_3')
+        _activation_summary('conv4_3', conv4_3)
+        pool4= tf.nn.max_pool(conv4_3, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool4')
+        
+        conv5_1 = self.new_conv_layer(pool4, [3,3,512,512], use_relu=True, name='conv5_1')
+        _activation_summary('conv5_1', conv5_1)
+        conv5_2 = self.new_conv_layer(conv5_1, [3,3,512,512], use_relu=True, name='conv5_2')
+        _activation_summary('conv5_2', conv5_2)
+        conv5_3 = self.new_conv_layer(conv5_2, [3,3,512,512], use_relu=True, name='conv5_3')
+        _activation_summary('conv5_3', conv5_3)
 
-            # Điều chỉnh trọng số cho 'output'
-            if 'output' in v.name:
-                g = 0.01 * g
+        # specialized layers
+        target_shape = tf.concat(values=[tf.slice(tf.shape(imgs), [0], [3]),tf.constant(16,shape=[1,])], axis=0)  
+        spe_1 = self.new_conv_layer(conv1_2, [3,3,64,16], use_relu=True, name='spe_1')
+        _activation_summary('spe_1', spe_1)
+        spe_2 = self.new_conv_layer(conv2_2, [3,3,128,16], use_relu=True, name='spe_2')
+        _activation_summary('spe_2', spe_2)
+        resized_spe_2 = self.new_deconv_layer(spe_2, [4,4,16,16], target_shape, [1,2,2,1], use_relu=True, name='resized_spe_2') 
+        spe_3 = self.new_conv_layer(conv3_3, [3,3,256,16], use_relu=True, name='spe_3')
+        _activation_summary('spe_3', spe_3)
+        resized_spe_3 = self.new_deconv_layer(spe_3, [8,8,16,16], target_shape, [1,4,4,1], use_relu=True, name='resized_spe_3')
+        spe_4 = self.new_conv_layer(conv4_3, [3,3,512,16], use_relu=True, name='spe_4')
+        _activation_summary('spe_4', spe_4)
+        resized_spe_4 = self.new_deconv_layer(spe_4, [16,16,16,16], target_shape, [1,8,8,1], use_relu=True, name='resized_spe_4')
+        spe_5 = self.new_conv_layer(conv5_3, [3,3,512,16], use_relu=True, name='spe_5')
+        _activation_summary('spe_5', spe_5)
+        resized_spe_5 = self.new_deconv_layer(spe_5, [32,32,16,16], target_shape, [1,16,16,1], use_relu=True, name='resized_spe_5')
+        spe_concat = tf.concat(values=[spe_1,resized_spe_2,resized_spe_3,resized_spe_4,resized_spe_5], axis=3)
 
-            # Bỏ qua gradient cho 'resized' (theo logic 'map' cũ)
-            if 'resized' in v.name:
-                g = None
-                processed_gvs.append((g, v))
-                continue
+        output = self.new_conv_layer(spe_concat, [1,1,16*5,1], name='output')
+        _activation_summary('output', output)
+        
+        fg_prob = tf.sigmoid(output)
 
-            # Cắt gradient
-            g = tf.clip_by_value(g, -5., 5.)
-            processed_gvs.append((g, v))
+        ### Compute the loss ###
+        binary_mask_fg = tf.compat.v1.to_float(tf.equal(labels, 1))
+        binary_mask_bg = tf.compat.v1.to_float(tf.not_equal(labels, 1))
+        combined_mask = tf.concat(values=[binary_mask_bg,binary_mask_fg], axis=3)
+        flat_one_hot_labels = tf.reshape(tensor=combined_mask, shape=(-1, 2))
+        flat_labels = tf.reshape(tensor=labels, shape=(-1,))
+        flat_logits = tf.reshape(tensor=output, shape=(-1,))        
+        cross_entropies = tf.nn.sigmoid_cross_entropy_with_logits(logits=flat_logits, labels=tf.compat.v1.to_float(flat_labels))
+        
+        """# simple cross entropy loss  
+        loss = tf.reduce_mean(cross_entropies)"""
+        # weighted cross entropy loss
+        num_pixel = tf.size(labels)
+        num_pixel_fg = tf.compat.v1.count_nonzero(binary_mask_fg, dtype=tf.int32)
+        num_pixel_bg = num_pixel - num_pixel_fg
+        class_weight = tf.cast(tf.concat(values=[tf.reshape(tf.divide(num_pixel_fg,num_pixel),(1,1)), \
+                                                tf.reshape(tf.divide(num_pixel_bg,num_pixel),(1,1))], axis=1), dtype=tf.float32)
+        weight_per_label = tf.transpose(tf.matmul(flat_one_hot_labels,tf.transpose(class_weight))) #shape [1, TRAIN.BATCH_SIZE]
+        # this is the weight for each datapoint, depending on its label
+        loss = tf.reduce_mean(tf.multiply(weight_per_label,cross_entropies))
+         
+        weights_only = filter( lambda x: x.name.endswith('W:0'), tf.compat.v1.trainable_variables() )
+        weight_decay = tf.reduce_sum(tf.stack([tf.nn.l2_loss(x) for x in weights_only])) * cfg.TRAIN.WEIGHT_DECAY_RATE
+        loss += weight_decay
+        
+        ### Compute the accuracy ###
+        flat_bin_output = tf.greater_equal(tf.reshape(tensor=fg_prob, shape=(-1,)), 0.5)
+        # accuracy
+        correct = tf.compat.v1.to_float(tf.equal(flat_bin_output,tf.cast(flat_labels, tf.bool)))
+        accuracy = tf.reduce_mean(correct)
+        # precision, recall
+        num_fg_output = tf.reduce_sum(tf.compat.v1.to_float(flat_bin_output))
+        tp = tf.reduce_sum(tf.compat.v1.to_float(tf.logical_and(tf.cast(flat_labels, dtype=tf.bool), flat_bin_output)))
+        pre = tf.divide(tp,tf.add(num_fg_output,cfg.EPSILON))
+        rec = tf.divide(tp,tf.compat.v1.to_float(num_pixel_fg))
+        
+        ### Build the solver ###
+        if self.params.opt=='adam':
+            train_op = tf.compat.v1.train.AdamOptimizer(self.params.lr, epsilon=0.1).minimize(loss, global_step=self.global_step)
+        elif self.params.opt=='sgd':
+            if self.params.lr_decay=='const':
+                # constant
+                optimizer = tf.compat.v1.train.MomentumOptimizer(self.params.lr, cfg.TRAIN.MOMENTUM, use_nesterov=True)
+                grads_and_vars = optimizer.compute_gradients(loss)
+                grads_and_vars = map(lambda gv: (0.01*gv[0],gv[1]) if 'output' in gv[1].name else (gv[0],gv[1]), grads_and_vars)
+                grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = [(tf.clip_by_value(gv[0], -5., 5.), gv[1]) for gv in grads_and_vars]
+                train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)
+            elif self.params.lr_decay=='pc':
+                # piecewise_constant
+                boundaries = [int(self.params.max_iters*0.5),int(self.params.max_iters*0.75)]
+                values = [self.params.lr,self.params.lr*0.5,self.params.lr*0.25]
 
-        return processed_gvs
+                learning_rate = tf.compat.v1.train.piecewise_constant(self.global_step, boundaries, values)
+                #train_op = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True).minimize(loss, global_step=self.global_step)
+                optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True)
+                grads_and_vars = optimizer.compute_gradients(loss)
+                grads_and_vars = map(lambda gv: (0.01*gv[0],gv[1]) if 'output' in gv[1].name else (gv[0],gv[1]), grads_and_vars)
+                grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = map(lambda gv: (None,gv[1]) if 'resized' in gv[1].name else (tf.clip_by_value(gv[0], -5., 5.),gv[1]), grads_and_vars)
+                #grads_and_vars = [(tf.clip_by_value(gv[0], -5., 5.), gv[1]) for gv in grads_and_vars]
+                train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)
+            elif self.params.lr_decay=='exp':
+                # exponential_decay
+                learning_rate = tf.compat.v1.train.exponential_decay(self.params.lr, self.global_step, self.params.max_iters/20, 0.9, staircase=False)
+                #train_op = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True).minimize(loss, global_step=self.global_step)   
+                optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True)
+                grads_and_vars = optimizer.compute_gradients(loss)
+                grads_and_vars = [(tf.clip_by_value(gv[0], -5., 5.), gv[1]) for gv in grads_and_vars]
+                train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)
 
-    # Ghi đè train_step để tùy chỉnh vòng lặp huấn luyện
-    def train_step(self, data):
-        """Thực hiện một bước huấn luyện."""
-        # Dữ liệu đầu vào dự kiến là một tuple/list: (imgs, labels, fov_masks)
-        imgs, labels, fov_masks = data
+        ### Hang up the results ###
+        self.imgs = imgs
+        self.labels = labels
+        self.is_training = is_training
+        
+        self.conv_feats = spe_concat
+        self.output = output
+        self.fg_prob = fg_prob
+        
+        self.flat_bin_output = flat_bin_output
+        self.tp = tp
+        self.num_fg_output = num_fg_output
+        self.num_pixel_fg = num_pixel_fg        
+        
+        self.accuracy = accuracy
+        self.precision = pre        
+        self.recall = rec
+        
+        self.loss = loss
+        self.train_op = train_op
 
-        with tf.GradientTape() as tape:
-            # Chạy thuận
-            output, fg_prob = self(imgs, training=True)
-            # Tính loss
-            total_loss = self.compute_loss_fn(output, labels, fov_masks)
-
-        # Tính gradients
-        trainable_vars = self.trainable_variables
-        grads = tape.gradient(total_loss, trainable_vars)
-        grads_and_vars = zip(grads, trainable_vars)
-
-        # Xử lý gradients (cắt, điều chỉnh,...)
-        processed_grads_and_vars = self._process_gradients(grads_and_vars)
-
-        # Áp dụng gradients
-        self.optimizer.apply_gradients(processed_grads_and_vars)
-
-        # Tính toán metrics
-        metrics = self.compute_metrics(output, fg_prob, labels)
-        metrics['loss'] = total_loss
-
-        return metrics
-
-    # Ghi đè test_step để tùy chỉnh vòng lặp đánh giá
-    def test_step(self, data):
-        imgs, labels, fov_masks = data
-
-        # Chạy thuận
-        output, fg_prob = self(imgs, training=False)
-        # Tính loss
-        total_loss = self.compute_loss_fn(output, labels, fov_masks)
-
-        # Tính toán metrics
-        metrics = self.compute_metrics(output, fg_prob, labels)
-        metrics['loss'] = total_loss
-
-        return metrics
-
-
-class VesselSegmVGN(BaseModel):
+        
+class vessel_segm_vgn(base_model):
     def __init__(self, params, weight_file_path):
-        super(VesselSegmVGN, self).__init__(weight_file_path)
+        base_model.__init__(self, weight_file_path)
         self.params = params
-
+        
         # cnn module related
         self.cnn_model = params.cnn_model
         self.cnn_loss_on = params.cnn_loss_on
-
+        
         # gnn module related
         self.win_size = params.win_size
         self.gnn_loss_on = params.gnn_loss_on
         self.gnn_loss_weight = params.gnn_loss_weight
-
+        
         # inference module related
         self.infer_module_kernel_size = params.infer_module_kernel_size
 
-        self.num_spe_channels = 16 # fixed
-        self.cnn_feat = {}
-        self.cnn_feat_spatial_sizes = {}
-
-        self.var_to_restore = [] # Sẽ được điền trong _build_...
-
-        # Xây dựng các mô-đun
-        self._build_cnn_module_layers()
-        self._build_gat_layers()
-        self._build_infer_module_layers()
-
-        # Xây dựng bộ tối ưu hóa
-        self._build_optimizer()
-
-    def _build_optimizer(self):
-        """Xây dựng bộ tối ưu hóa và lịch trình học."""
-
-        # LR Handler
-        if self.params.lr_scheduling == 'pc':
-            boundaries = [int(self.params.max_iters * self.params.lr_decay_tp)]
-            if self.params.old_net_ft_lr == 0:
-                # Chỉ huấn luyện mạng mới
-                values = [self.params.new_net_lr, self.params.new_net_lr * 0.1]
-            else:
-                # Huấn luyện toàn bộ mạng
-                values = [self.params.old_net_ft_lr, self.params.old_net_ft_lr * 0.1]
-            self.lr_schedule = optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
-        else:
-            raise NotImplementedError(f"LR scheduling {self.params.lr_scheduling} not implemented.")
-
-        # Optimizer
-        if self.params.opt == 'adam':
-            self.optimizer = optimizers.Adam(learning_rate=self.lr_schedule, epsilon=0.1)
-        elif self.params.opt == 'sgd':
-            self.optimizer = optimizers.SGD(
-                learning_rate=self.lr_schedule,
-                momentum=cfg.TRAIN.MOMENTUM,
-                nesterov=True
-            )
-        else:
-            raise NotImplementedError(f"Optimizer {self.params.opt} not implemented.")
-
-    def _add_layer_to_restore(self, name):
-        if name not in self.var_to_restore:
-            self.var_to_restore.append(name)
-
-    def _build_cnn_module_layers(self):
-        """Định nghĩa các lớp Keras cho mô-đun CNN (Driu hoặc Driu-Large)."""
-        print("Building CNN module layers...")
-        if self.cnn_model not in ['driu', 'driu_large']:
-            raise NotImplementedError(f"CNN model {self.cnn_model} not implemented.")
-
-        reg = self._get_regularizer()
-        n = self.num_spe_channels
-
-        # VGG-style backbone
-        self.conv1_1 = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv1_1')
-        self.conv1_2 = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv1_2')
-        self.pool1 = layers.MaxPool2D(2, strides=2, padding='same', name='pool1')
-        self._add_layer_to_restore('conv1_1')
-        self._add_layer_to_restore('conv1_2')
-
-        self.conv2_1 = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv2_1')
-        self.conv2_2 = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv2_2')
-        self.pool2 = layers.MaxPool2D(2, strides=2, padding='same', name='pool2')
-        self._add_layer_to_restore('conv2_1')
-        self._add_layer_to_restore('conv2_2')
-
-        self.conv3_1 = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv3_1')
-        self.conv3_2 = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv3_2')
-        self.conv3_3 = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv3_3')
-        self.pool3 = layers.MaxPool2D(2, strides=2, padding='same', name='pool3')
-        self._add_layer_to_restore('conv3_1')
-        self._add_layer_to_restore('conv3_2')
-        self._add_layer_to_restore('conv3_3')
-
-        self.conv4_1 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv4_1')
-        self.conv4_2 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv4_2')
-        self.conv4_3 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv4_3')
-        self._add_layer_to_restore('conv4_1')
-        self._add_layer_to_restore('conv4_2')
-        self._add_layer_to_restore('conv4_3')
-
-        # Lớp chuyên biệt (Specialized layers)
-        self.spe_1 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_1')
-        self.spe_2 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_2')
-        self.spe_3 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_3')
-        self.spe_4 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_4')
-        self._add_layer_to_restore('spe_1')
-        self._add_layer_to_restore('spe_2')
-        self._add_layer_to_restore('spe_3')
-        self._add_layer_to_restore('spe_4')
-
-        # Lớp giải mã (Deconv layers)
-        init_2 = tf.keras.initializers.Constant(get_deconv_filter([4, 4, n, n]))
-        self.resized_spe_2 = layers.Conv2DTranspose(n, 4, strides=2, padding='same', activation='relu', kernel_initializer=init_2, kernel_regularizer=reg, name='resized_spe_2')
-        self._add_layer_to_restore('resized_spe_2')
-
-        init_4 = tf.keras.initializers.Constant(get_deconv_filter([8, 8, n, n]))
-        self.resized_spe_3 = layers.Conv2DTranspose(n, 8, strides=4, padding='same', activation='relu', kernel_initializer=init_4, kernel_regularizer=reg, name='resized_spe_3')
-        self._add_layer_to_restore('resized_spe_3')
-
-        init_8 = tf.keras.initializers.Constant(get_deconv_filter([16, 16, n, n]))
-        self.resized_spe_4 = layers.Conv2DTranspose(n, 16, strides=8, padding='same', activation='relu', kernel_initializer=init_8, kernel_regularizer=reg, name='resized_spe_4')
-        self._add_layer_to_restore('resized_spe_4')
-
-        if self.cnn_model == 'driu_large':
-            self.pool4 = layers.MaxPool2D(2, strides=2, padding='same', name='pool4')
-            self.conv5_1 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv5_1')
-            self.conv5_2 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv5_2')
-            self.conv5_3 = layers.Conv2D(512, 3, padding='same', activation='relu', kernel_regularizer=reg, name='conv5_3')
-            self.spe_5 = layers.Conv2D(n, 3, padding='same', activation='relu', kernel_regularizer=reg, name='spe_5')
-            self._add_layer_to_restore('conv5_1')
-            self._add_layer_to_restore('conv5_2')
-            self._add_layer_to_restore('conv5_3')
-            self._add_layer_to_restore('spe_5')
-
-            init_16 = tf.keras.initializers.Constant(get_deconv_filter([32, 32, n, n]))
-            self.resized_spe_5 = layers.Conv2DTranspose(n, 32, strides=16, padding='same', activation='relu', kernel_initializer=init_16, kernel_regularizer=reg, name='resized_spe_5')
-            self._add_layer_to_restore('resized_spe_5')
-
-            self.img_output_layer = layers.Conv2D(1, 1, padding='same', kernel_regularizer=reg, name='img_output')
-        else: # 'driu'
-            self.img_output_layer = layers.Conv2D(1, 1, padding='same', kernel_regularizer=reg, name='img_output')
-
-        self._add_layer_to_restore('img_output')
-        print("CNN module layers built.")
-
-    def _build_gat_layers(self):
-        """Định nghĩa các lớp Keras cho mô-đun GAT."""
-        print("Building GAT layers...")
-        self.gat_layers = [] # Sẽ chứa các lớp con (Conv1D)
-
-        # GAT sử dụng các lớp Conv1D để biến đổi đặc trưng
-        # Lớp 1
-        n_heads = self.params.gat_n_heads[0]
-        hid_units = self.params.gat_hid_units[0]
-        head_layers = []
-        for i in range(n_heads):
-            name = f'gat_hidden_1_{i+1}'
-            # Mỗi head bao gồm các phép biến đổi
-            head_layers.append({
-                'fts': layers.Conv1D(hid_units, 1, use_bias=False, name=f'{name}_fts'),
-                'f_1': layers.Conv1D(1, 1, name=f'{name}_f1'),
-                'f_2': layers.Conv1D(1, 1, name=f'{name}_f2'),
-                'bias': self.add_weight(name=f'{name}_bias', shape=(hid_units,), initializer='zeros', trainable=True)
-            })
-            self._add_layer_to_restore(name)
-        self.gat_layers.append(head_layers)
-
-        # Các lớp ẩn tiếp theo
-        for i in range(1, len(self.params.gat_hid_units)):
-            n_heads = self.params.gat_n_heads[i]
-            hid_units = self.params.gat_hid_units[i]
-            head_layers = []
-            for j in range(n_heads):
-                name = f'gat_hidden_{i+1}_{j+1}'
-                head_layers.append({
-                    'fts': layers.Conv1D(hid_units, 1, use_bias=False, name=f'{name}_fts'),
-                    'f_1': layers.Conv1D(1, 1, name=f'{name}_f1'),
-                    'f_2': layers.Conv1D(1, 1, name=f'{name}_f2'),
-                    'bias': self.add_weight(name=f'{name}_bias', shape=(hid_units,), initializer='zeros', trainable=True)
-                })
-                self._add_layer_to_restore(name)
-            self.gat_layers.append(head_layers)
-
-        # Lớp đầu ra (output logits)
-        n_heads = self.params.gat_n_heads[-1]
-        head_layers = []
-        for i in range(n_heads):
-            name = f'gat_node_logits_{i+1}'
-            head_layers.append({
-                'fts': layers.Conv1D(1, 1, use_bias=False, name=f'{name}_fts'),
-                'f_1': layers.Conv1D(1, 1, name=f'{name}_f1'),
-                'f_2': layers.Conv1D(1, 1, name=f'{name}_f2'),
-                'bias': self.add_weight(name=f'{name}_bias', shape=(1,), initializer='zeros', trainable=True)
-            })
-            self._add_layer_to_restore(name)
-        self.gat_layers.append(head_layers)
-
-        print("GAT layers built.")
-
-    def _build_infer_module_layers(self):
-        """Định nghĩa các lớp Keras cho mô-đun suy luận (Inference Module)."""
-        print("Building Inference module layers...")
-        reg = self._get_regularizer()
-        k = self.infer_module_kernel_size
-        norm_type = self.params.norm_type
-
-        # Lớp nén (compression)
-        temp_num_chs = self.params.gat_n_heads[-2] * self.params.gat_hid_units[-1]
-        self.post_cnn_conv_comp_layers = [
-            layers.Conv2D(32, 1, kernel_regularizer=reg, use_bias=(norm_type is None), name='post_cnn_conv_comp'),
-            self._get_norm_layer(norm_type, 32),
-            layers.ReLU()
-        ]
-
-        self.post_cnn_deconv_layers = {}
-        self.post_cnn_fuse_layers = {}
-        self.post_cnn_skip_layers = {}
-
-        ds_rate = self.win_size // 2
-        while ds_rate >= 1:
-            ds_rate_int = int(ds_rate)
-
-            # Lớp Deconv
-            init_deconv = tf.keras.initializers.Constant(get_deconv_filter([4, 4, 16, 32]))
-            self.post_cnn_deconv_layers[ds_rate_int] = [
-                layers.Conv2DTranspose(16, 4, strides=2, padding='same', kernel_initializer=init_deconv, kernel_regularizer=reg, use_bias=(norm_type is None), name=f'post_cnn_deconv{ds_rate_int}'),
-                self._get_norm_layer(norm_type, 16),
-                layers.ReLU()
-            ]
-
-            # Lớp xử lý Skip-connection
-            if self.params.use_enc_layer:
-                self.post_cnn_skip_layers[ds_rate_int] = [
-                    layers.Conv2D(16, 1, kernel_regularizer=reg, use_bias=(norm_type is None), name=f'post_cnn_cnn_feat{ds_rate_int}'),
-                    self._get_norm_layer(norm_type, 16),
-                    layers.ReLU()
-                ]
-            else: # Chỉ chuẩn hóa và ReLU
-                self.post_cnn_skip_layers[ds_rate_int] = [
-                    self._get_norm_layer(norm_type, 16), # Tên 'post_cnn_cnn_feat' được dùng cho GN
-                    layers.ReLU()
-                ]
-
-            # Lớp kết hợp (Fuse)
-            if ds_rate_int == 1:
-                # Lớp đầu ra cuối cùng
-                self.post_cnn_fuse_layers[ds_rate_int] = [
-                    layers.Conv2D(1, k, padding='same', kernel_regularizer=reg, name='post_cnn_img_output')
-                ]
-            else:
-                self.post_cnn_fuse_layers[ds_rate_int] = [
-                    layers.Conv2D(32, k, padding='same', kernel_regularizer=reg, use_bias=(norm_type is None), name=f'post_cnn_conv{ds_rate_int}'),
-                    self._get_norm_layer(norm_type, 32),
-                    layers.ReLU()
-                ]
-
-            ds_rate = ds_rate / 2
-
-        print("Inference module layers built.")
-
-    def _run_cnn_module(self, imgs):
-        """Chạy mô-đun CNN."""
-        # Backbone
-        x = self.conv1_1(imgs)
-        conv1_2 = self.conv1_2(x)
-        self.cnn_feat[1] = self.spe_1(conv1_2)
-        self.cnn_feat_spatial_sizes[1] = tf.shape(self.cnn_feat[1])[1:3]
-        x = self.pool1(conv1_2)
-
-        x = self.conv2_1(x)
-        conv2_2 = self.conv2_2(x)
-        self.cnn_feat[2] = self.spe_2(conv2_2)
-        self.cnn_feat_spatial_sizes[2] = tf.shape(self.cnn_feat[2])[1:3]
-        x = self.pool2(conv2_2)
-
-        x = self.conv3_1(x)
-        x = self.conv3_2(x)
-        conv3_3 = self.conv3_3(x)
-        self.cnn_feat[4] = self.spe_3(conv3_3)
-        self.cnn_feat_spatial_sizes[4] = tf.shape(self.cnn_feat[4])[1:3]
-        x = self.pool3(conv3_3)
-
-        x = self.conv4_1(x)
-        x = self.conv4_2(x)
-        conv4_3 = self.conv4_3(x)
-        self.cnn_feat[8] = self.spe_4(conv4_3)
-        self.cnn_feat_spatial_sizes[8] = tf.shape(self.cnn_feat[8])[1:3]
-
-        # Lớp chuyên biệt
-        rspe_2 = self.resized_spe_2(self.cnn_feat[2])
-        rspe_3 = self.resized_spe_3(self.cnn_feat[4])
-        rspe_4 = self.resized_spe_4(self.cnn_feat[8])
-
-        spe_layers = [self.cnn_feat[1], rspe_2, rspe_3, rspe_4]
-
-        if self.cnn_model == 'driu_large':
-            x = self.pool4(conv4_3)
-            x = self.conv5_1(x)
-            x = self.conv5_2(x)
-            conv5_3 = self.conv5_3(x)
-            self.cnn_feat[16] = self.spe_5(conv5_3)
-            self.cnn_feat_spatial_sizes[16] = tf.shape(self.cnn_feat[16])[1:3]
-
-            rspe_5 = self.resized_spe_5(self.cnn_feat[16])
-            spe_layers.append(rspe_5)
-
-        conv_feats = tf.concat(values=spe_layers, axis=3)
-        img_output = self.img_output_layer(conv_feats)
-        img_fg_prob = tf.sigmoid(img_output)
-
-        return conv_feats, img_output, img_fg_prob
-
-    def _sp_attn_head(self, bottom, adj, head_layers, feat_dropout=0., att_dropout=0., residual=False, act=tf.nn.elu, show_adj=False):
-        """Chạy một đầu attention (attention head) của GAT."""
-
-        if feat_dropout != 0.0:
-            bottom = tf.nn.dropout(bottom, 1.0 - feat_dropout)
-
-        fts = head_layers['fts'](bottom) # [1, num_nodes, out_size]
-
-        # Self-attention
-        f_1 = head_layers['f_1'](fts) # [1, num_nodes, 1]
-        f_2 = head_layers['f_2'](fts) # [1, num_nodes, 1]
-
-        num_nodes = tf.shape(adj)[0]
-        f_1 = tf.reshape(f_1, [num_nodes, 1])
-        f_2 = tf.reshape(f_2, [num_nodes, 1])
-
-        f_1 = adj * f_1
-        f_2 = adj * tf.transpose(f_2, [1, 0])
-
-        logits = tf.sparse.add(f_1, f_2)
-        lrelu = tf.SparseTensor(indices=logits.indices,
-                                values=tf.nn.leaky_relu(logits.values),
-                                dense_shape=logits.dense_shape)
-        coefs = tf.sparse.softmax(lrelu) # [num_nodes, num_nodes] (Sparse)
-
-        if att_dropout != 0.0:
-            coefs = tf.SparseTensor(indices=coefs.indices,
-                                    values=tf.nn.dropout(coefs.values, 1.0 - att_dropout),
-                                    dense_shape=coefs.dense_shape)
-        if feat_dropout != 0.0:
-            fts = tf.nn.dropout(fts, 1.0 - feat_dropout)
-
-        # coefs = tf.sparse.reshape(coefs, [num_nodes, num_nodes]) # Không cần thiết
-        fts_squeezed = tf.squeeze(fts, [0]) # [num_nodes, out_size]
-        vals = tf.sparse.sparse_dense_matmul(coefs, fts_squeezed) # [num_nodes, out_size]
-        vals = tf.expand_dims(vals, axis=0) # [1, num_nodes, out_size]
-
-        # Thêm bias (thay thế tf.contrib.layers.bias_add)
-        ret = tf.nn.bias_add(vals, head_layers['bias'])
-
-        # Residual connection
-        if residual:
-            if bottom.shape[-1] != ret.shape[-1]:
-                # Cần thêm một lớp Conv1D để khớp kích thước
-                # Điều này cần được định nghĩa trong __init__, tạm thời bỏ qua vì phức tạp
-                # và mã gốc có vẻ cũng không xử lý triệt để
-                print("Warning: Residual connection dimensionality mismatch not fully implemented.")
-                ret = ret + layers.Conv1D(ret.shape[-1], 1)(bottom) # Thêm lớp 1x1
-            else:
-                ret = ret + bottom
-
+        self.global_step = tf.Variable(0, name='global_step', trainable=False)
+        
+        self.build_model()
+        
+    # special layer for graph attention network
+    def sp_attn_head(self, bottom, output_size, adj, name, act=tf.nn.elu, feat_dropout=0., att_dropout=0., residual=False, show_adj=False):
+       
+        with tf.compat.v1.variable_scope(name) as scope:
+            if feat_dropout != 0.0:
+                bottom = tf.nn.dropout(bottom, 1.0 - feat_dropout)
+    
+            fts = tf.keras.layers.Conv1D(output_size, 1, use_bias=False)(bottom)
+    
+            # simplest self-attention possible
+            f_1 = tf.keras.layers.Conv1D(1, 1)(fts)
+            f_2 = tf.keras.layers.Conv1D(1, 1)(fts)
+            
+            num_nodes = tf.slice(tf.shape(adj),[0],[1])
+            f_1 = tf.reshape(f_1, tf.concat(values=[num_nodes,tf.constant(1,shape=[1,])], axis=0))
+            f_2 = tf.reshape(f_2, tf.concat(values=[num_nodes,tf.constant(1,shape=[1,])], axis=0)) 
+    
+            f_1 = adj * f_1
+            f_2 = adj * tf.transpose(f_2, [1,0])
+    
+            logits = tf.compat.v1.sparse_add(f_1, f_2)
+            lrelu = tf.SparseTensor(indices=logits.indices, 
+                    values=tf.nn.leaky_relu(logits.values), 
+                    dense_shape=logits.dense_shape)
+            coefs = tf.compat.v1.sparse_softmax(lrelu)
+    
+            if att_dropout != 0.0:
+                coefs = tf.SparseTensor(indices=coefs.indices,
+                        values=tf.nn.dropout(coefs.values, 1.0 - att_dropout),
+                        dense_shape=coefs.dense_shape)
+            if feat_dropout != 0.0:
+                fts = tf.nn.dropout(fts, 1.0 - feat_dropout)
+    
+            coefs = tf.compat.v1.sparse_reshape(coefs, tf.concat(values=[num_nodes,num_nodes], axis=0))
+            fts = tf.squeeze(fts, [0])
+            vals = tf.compat.v1.sparse_tensor_dense_matmul(coefs, fts)
+            vals = tf.expand_dims(vals, axis=0)
+            vals = tf.reshape(vals, tf.concat(values=[tf.constant(1,shape=[1,]),num_nodes,tf.constant(output_size,shape=[1,])], axis=0))
+            bias = tf.Variable(tf.zeros([output_size]), name="bias")
+            ret = tf.nn.bias_add(vals, bias)
+    
+            # residual connection
+            if residual:
+                if bottom.shape[-1] != ret.shape[-1]:
+                    ret = ret + tf.keras.layers.Conv1D(ret.shape[-1], 1)(bottom) # activation
+                else:
+                    ret = ret + bottom
+    
         if show_adj:
+            #return act(ret), tf.sparse_reshape(lrelu, tf.concat(values=[num_nodes,num_nodes], axis=0))
             return act(ret), coefs
         else:
             return act(ret)
+    
+    def build_model(self):
+        """Build the model."""
+        print("Building the model...")
+        self.build_cnn_module()
+        self.build_gat() # GAT for our GNN module
+        self.build_infer_module()
+        self.build_optimizer()
+        print("Model built.")
+        
+    def build_cnn_module(self):
+        """Build the CNN module."""
+        print("Building the CNN module...")
+        if self.cnn_model=='driu':
+            self.build_driu()
+        elif self.cnn_model=='driu_large':
+            self.build_driu_large()
+        else:
+            raise NotImplementedError
+        print("CNN module built.")
+        
+    def build_driu(self):
 
-    def _run_gat_module(self, conv_feats, node_byxs, adj, gnn_feat_dropout=0., gnn_att_dropout=0.):
-        """Chạy mô-đun GAT."""
+        imgs = tf.compat.v1.placeholder(tf.float32, [None, None, None, 3], name='imgs') # note that the input is RGB
+        labels = tf.compat.v1.placeholder(tf.int64, [None, None, None, 1], name='labels')
+        fov_masks = tf.compat.v1.placeholder(tf.int64, [None, None, None, 1], name='fov_masks')
 
-        node_feats = tf.gather_nd(conv_feats, node_byxs) # [num_nodes, num_channels]
-        node_feats_resh = tf.expand_dims(node_feats, axis=0) # [1, num_nodes, num_channels]
+        conv1_1 = self.new_conv_layer(imgs, [3,3,3,64], use_relu=True, name='conv1_1')
+        _activation_summary('conv1_1', conv1_1)
+        conv1_2 = self.new_conv_layer(conv1_1, [3,3,64,64], use_relu=True, name='conv1_2')
+        _activation_summary('conv1_2', conv1_2)
+        pool1 = tf.nn.max_pool(conv1_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool1')
+                               
+        conv2_1 = self.new_conv_layer(pool1, [3,3,64,128], use_relu=True, name='conv2_1')
+        _activation_summary('conv2_1', conv2_1)
+        conv2_2 = self.new_conv_layer(conv2_1, [3,3,128,128], use_relu=True, name='conv2_2')
+        _activation_summary('conv2_2', conv2_2)
+        pool2 = tf.nn.max_pool(conv2_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool2')                               
+                               
+        conv3_1 = self.new_conv_layer(pool2, [3,3,128,256], use_relu=True, name='conv3_1')
+        _activation_summary('conv3_1', conv3_1)
+        conv3_2 = self.new_conv_layer(conv3_1, [3,3,256,256], use_relu=True, name='conv3_2')
+        _activation_summary('conv3_2', conv3_2)
+        conv3_3 = self.new_conv_layer(conv3_2, [3,3,256,256], use_relu=True, name='conv3_3')
+        _activation_summary('conv3_3', conv3_3)
+        pool3 = tf.nn.max_pool(conv3_3, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool3')
+                               
+        conv4_1 = self.new_conv_layer(pool3, [3,3,256,512], use_relu=True, name='conv4_1')
+        _activation_summary('conv4_1', conv4_1)
+        conv4_2 = self.new_conv_layer(conv4_1, [3,3,512,512], use_relu=True, name='conv4_2')
+        _activation_summary('conv4_2', conv4_2)
+        conv4_3 = self.new_conv_layer(conv4_2, [3,3,512,512], use_relu=True, name='conv4_3')
+        _activation_summary('conv4_3', conv4_3)
 
-        h_1 = node_feats_resh
+        # specialized layers
+        target_shape = tf.concat(values=[tf.slice(tf.shape(imgs), [0], [3]),tf.constant(16,shape=[1,])], axis=0)  
+        spe_1 = self.new_conv_layer(conv1_2, [3,3,64,16], use_relu=True, name='spe_1')
+        _activation_summary('spe_1', spe_1)
+        spe_2 = self.new_conv_layer(conv2_2, [3,3,128,16], use_relu=True, name='spe_2')
+        _activation_summary('spe_2', spe_2)
+        resized_spe_2 = self.new_deconv_layer(spe_2, [4,4,16,16], target_shape, [1,2,2,1], use_relu=True, name='resized_spe_2') 
+        spe_3 = self.new_conv_layer(conv3_3, [3,3,256,16], use_relu=True, name='spe_3')
+        _activation_summary('spe_3', spe_3)
+        resized_spe_3 = self.new_deconv_layer(spe_3, [8,8,16,16], target_shape, [1,4,4,1], use_relu=True, name='resized_spe_3')
+        spe_4 = self.new_conv_layer(conv4_3, [3,3,512,16], use_relu=True, name='spe_4')
+        _activation_summary('spe_4', spe_4)
+        resized_spe_4 = self.new_deconv_layer(spe_4, [16,16,16,16], target_shape, [1,8,8,1], use_relu=True, name='resized_spe_4')  
+        spe_concat = tf.concat(values=[spe_1,resized_spe_2,resized_spe_3,resized_spe_4], axis=3)
+        
+        img_output = self.new_conv_layer(spe_concat, [1,1,16*4,1], name='img_output')
+        _activation_summary('img_output', img_output)
+        
+        img_fg_prob = tf.sigmoid(img_output)
+        
+        ### Hang up the results ###
+        self.imgs = imgs
+        self.labels = labels
+        self.fov_masks = fov_masks
+        
+        self.cnn_feat = {}
+        self.cnn_feat[1] = spe_1
+        self.cnn_feat[2] = spe_2
+        self.cnn_feat[4] = spe_3
+        self.cnn_feat[8] = spe_4
+        
+        self.cnn_feat_spatial_sizes = {}
+        self.cnn_feat_spatial_sizes[1] = tf.slice(tf.shape(spe_1),[1],[2])
+        self.cnn_feat_spatial_sizes[2] = tf.slice(tf.shape(spe_2),[1],[2])
+        self.cnn_feat_spatial_sizes[4] = tf.slice(tf.shape(spe_3),[1],[2])
+        self.cnn_feat_spatial_sizes[8] = tf.slice(tf.shape(spe_4),[1],[2])
+        
+        self.conv_feats = spe_concat
+        self.img_output = img_output
+        self.img_fg_prob = img_fg_prob
+        
+        self.var_to_restore = ['conv1_1','conv1_2', \
+                               'conv2_1','conv2_2', \
+                               'conv3_1','conv3_2','conv3_3', \
+                               'conv4_1','conv4_2','conv4_3', \
+                               'spe_1', 'spe_2', 'spe_3', 'spe_4', \
+                               'resized_spe_2', 'resized_spe_3', 'resized_spe_4', \
+                               'img_output']
+        
+    def build_driu_large(self):
 
-        # Lớp 1
+        imgs = tf.compat.v1.placeholder(tf.float32, [None, None, None, 3], name='imgs') # note that the input is RGB
+        labels = tf.compat.v1.placeholder(tf.int64, [None, None, None, 1], name='labels')
+        fov_masks = tf.compat.v1.placeholder(tf.int64, [None, None, None, 1], name='fov_masks')
+
+        conv1_1 = self.new_conv_layer(imgs, [3,3,3,64], use_relu=True, name='conv1_1')
+        _activation_summary('conv1_1', conv1_1)
+        conv1_2 = self.new_conv_layer(conv1_1, [3,3,64,64], use_relu=True, name='conv1_2')
+        _activation_summary('conv1_2', conv1_2)
+        pool1 = tf.nn.max_pool(conv1_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool1')
+                               
+        conv2_1 = self.new_conv_layer(pool1, [3,3,64,128], use_relu=True, name='conv2_1')
+        _activation_summary('conv2_1', conv2_1)
+        conv2_2 = self.new_conv_layer(conv2_1, [3,3,128,128], use_relu=True, name='conv2_2')
+        _activation_summary('conv2_2', conv2_2)
+        pool2 = tf.nn.max_pool(conv2_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool2')                               
+                               
+        conv3_1 = self.new_conv_layer(pool2, [3,3,128,256], use_relu=True, name='conv3_1')
+        _activation_summary('conv3_1', conv3_1)
+        conv3_2 = self.new_conv_layer(conv3_1, [3,3,256,256], use_relu=True, name='conv3_2')
+        _activation_summary('conv3_2', conv3_2)
+        conv3_3 = self.new_conv_layer(conv3_2, [3,3,256,256], use_relu=True, name='conv3_3')
+        _activation_summary('conv3_3', conv3_3)
+        pool3 = tf.nn.max_pool(conv3_3, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                               padding='SAME', name='pool3')
+                               
+        conv4_1 = self.new_conv_layer(pool3, [3,3,256,512], use_relu=True, name='conv4_1')
+        _activation_summary('conv4_1', conv4_1)
+        conv4_2 = self.new_conv_layer(conv4_1, [3,3,512,512], use_relu=True, name='conv4_2')
+        _activation_summary('conv4_2', conv4_2)
+        conv4_3 = self.new_conv_layer(conv4_2, [3,3,512,512], use_relu=True, name='conv4_3')
+        _activation_summary('conv4_3', conv4_3)
+        pool4= tf.nn.max_pool(conv4_3, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1],
+                              padding='SAME', name='pool4')
+        
+        conv5_1 = self.new_conv_layer(pool4, [3,3,512,512], use_relu=True, name='conv5_1')
+        _activation_summary('conv5_1', conv5_1)
+        conv5_2 = self.new_conv_layer(conv5_1, [3,3,512,512], use_relu=True, name='conv5_2')
+        _activation_summary('conv5_2', conv5_2)
+        conv5_3 = self.new_conv_layer(conv5_2, [3,3,512,512], use_relu=True, name='conv5_3')
+        _activation_summary('conv5_3', conv5_3)
+
+        # specialized layers
+        target_shape = tf.concat(values=[tf.slice(tf.shape(imgs), [0], [3]),tf.constant(16,shape=[1,])], axis=0)  
+        spe_1 = self.new_conv_layer(conv1_2, [3,3,64,16], use_relu=True, name='spe_1')
+        _activation_summary('spe_1', spe_1)
+        spe_2 = self.new_conv_layer(conv2_2, [3,3,128,16], use_relu=True, name='spe_2')
+        _activation_summary('spe_2', spe_2)
+        resized_spe_2 = self.new_deconv_layer(spe_2, [4,4,16,16], target_shape, [1,2,2,1], use_relu=True, name='resized_spe_2') 
+        spe_3 = self.new_conv_layer(conv3_3, [3,3,256,16], use_relu=True, name='spe_3')
+        _activation_summary('spe_3', spe_3)
+        resized_spe_3 = self.new_deconv_layer(spe_3, [8,8,16,16], target_shape, [1,4,4,1], use_relu=True, name='resized_spe_3')
+        spe_4 = self.new_conv_layer(conv4_3, [3,3,512,16], use_relu=True, name='spe_4')
+        _activation_summary('spe_4', spe_4)
+        resized_spe_4 = self.new_deconv_layer(spe_4, [16,16,16,16], target_shape, [1,8,8,1], use_relu=True, name='resized_spe_4')  
+        spe_5 = self.new_conv_layer(conv5_3, [3,3,512,16], use_relu=True, name='spe_5')
+        _activation_summary('spe_5', spe_5)
+        resized_spe_5 = self.new_deconv_layer(spe_5, [32,32,16,16], target_shape, [1,16,16,1], use_relu=True, name='resized_spe_5')
+        spe_concat = tf.concat(values=[spe_1,resized_spe_2,resized_spe_3,resized_spe_4,resized_spe_5], axis=3)
+        
+        img_output = self.new_conv_layer(spe_concat, [1,1,16*5,1], name='img_output')
+        _activation_summary('img_output', img_output)
+        
+        img_fg_prob = tf.sigmoid(img_output)
+        
+        ### Hang up the results ###
+        self.imgs = imgs
+        self.labels = labels
+        self.fov_masks = fov_masks
+        
+        self.cnn_feat = {}
+        self.cnn_feat[1] = spe_1
+        self.cnn_feat[2] = spe_2
+        self.cnn_feat[4] = spe_3
+        self.cnn_feat[8] = spe_4
+        self.cnn_feat[16] = spe_5
+        
+        self.cnn_feat_spatial_sizes = {}
+        self.cnn_feat_spatial_sizes[1] = tf.slice(tf.shape(spe_1),[1],[2])
+        self.cnn_feat_spatial_sizes[2] = tf.slice(tf.shape(spe_2),[1],[2])
+        self.cnn_feat_spatial_sizes[4] = tf.slice(tf.shape(spe_3),[1],[2])
+        self.cnn_feat_spatial_sizes[8] = tf.slice(tf.shape(spe_4),[1],[2])
+        self.cnn_feat_spatial_sizes[16] = tf.slice(tf.shape(spe_5),[1],[2])
+        
+        self.conv_feats = spe_concat
+        self.img_output = img_output
+        self.img_fg_prob = img_fg_prob
+        
+        self.var_to_restore = ['conv1_1','conv1_2', \
+                               'conv2_1','conv2_2', \
+                               'conv3_1','conv3_2','conv3_3', \
+                               'conv4_1','conv4_2','conv4_3', \
+                               'conv5_1','conv5_2','conv5_3', \
+                               'spe_1', 'spe_2', 'spe_3', 'spe_4', 'spe_5', \
+                               'resized_spe_2', 'resized_spe_3', 'resized_spe_4', 'resized_spe_5', \
+                               'img_output']
+        
+    def build_gat(self):
+        """Build the GAT."""
+        print("Building the GAT part...")
+        
+        node_byxs = tf.compat.v1.placeholder(tf.int32, [None, 3], name='node_byxs')
+        adj = tf.compat.v1.sparse_placeholder(tf.float32, [None, None], name='adj')
+        node_feats = tf.gather_nd(self.conv_feats, node_byxs, name='node_feats')
+        node_labels = tf.cast(tf.reshape(tf.gather_nd(self.labels, node_byxs), [-1]), tf.float32, name='node_labels')
+        
+        node_feats_resh = tf.expand_dims(node_feats, axis=0)
+
+        gnn_feat_dropout = tf.compat.v1.placeholder_with_default(0., shape=())
+        gnn_att_dropout = tf.compat.v1.placeholder_with_default(0., shape=())
+        
+        layer_name_list = []
         attns = []
-        for i in range(self.params.gat_n_heads[0]):
-            attns.append(self._sp_attn_head(h_1, adj, self.gat_layers[0][i],
-                                            feat_dropout=gnn_feat_dropout, att_dropout=gnn_att_dropout,
-                                            residual=self.params.gat_use_residual))
+        for head_idx in range(self.params.gat_n_heads[0]):
+            cur_name = 'gat_hidden_1_%d'%(head_idx+1)
+            layer_name_list.append(cur_name)
+            attns.append(self.sp_attn_head(node_feats_resh, self.params.gat_hid_units[0], adj, \
+                                           name=cur_name, \
+                                           feat_dropout=gnn_feat_dropout, att_dropout=gnn_att_dropout, \
+                                           residual=self.params.gat_use_residual))
         h_1 = tf.concat(attns, axis=-1)
-
-        # Các lớp ẩn
         for i in range(1, len(self.params.gat_hid_units)):
             attns = []
-            for j in range(self.params.gat_n_heads[i]):
-                attns.append(self._sp_attn_head(h_1, adj, self.gat_layers[i][j],
-                                                feat_dropout=gnn_feat_dropout, att_dropout=gnn_att_dropout,
-                                                residual=self.params.gat_use_residual))
+            for head_idx in range(self.params.gat_n_heads[i]):
+                cur_name = 'gat_hidden_%d_%d'%(i+1,head_idx+1)
+                layer_name_list.append(cur_name)
+                attns.append(self.sp_attn_head(h_1, self.params.gat_hid_units[i], adj, \
+                                               name=cur_name, \
+                                               feat_dropout=gnn_feat_dropout, att_dropout=gnn_att_dropout, \
+                                               residual=self.params.gat_use_residual))
             h_1 = tf.concat(attns, axis=-1)
-
-        # Lớp đầu ra
         out = []
-        for i in range(self.params.gat_n_heads[-1]):
-            out.append(self._sp_attn_head(h_1, adj, self.gat_layers[-1][i],
-                                          act=lambda x: x, # No activation
-                                          feat_dropout=gnn_feat_dropout, att_dropout=gnn_att_dropout,
-                                          residual=False))
-
+        for head_idx in range(self.params.gat_n_heads[-1]):
+            cur_name = 'gat_node_logits_%d'%(head_idx+1)
+            layer_name_list.append(cur_name)
+            out.append(self.sp_attn_head(h_1, 1, adj, \
+                                             name=cur_name, \
+                                             act=lambda x: x, \
+                                             feat_dropout=gnn_feat_dropout, att_dropout=gnn_att_dropout, \
+                                             residual=False)) 
+        
         node_logits = tf.add_n(out) / self.params.gat_n_heads[-1]
-        node_logits = tf.squeeze(node_logits, [0, 2]) # [num_nodes,]
+        node_logits = tf.squeeze(node_logits, [0,2])
+        
+        ### Hang up the results ###
+        self.node_logits = node_logits # [num_nodes,]
+        self.gnn_final_feats = tf.squeeze(h_1) # [num_nodes, self.params.gat_hid_units[-1]]
+                
+        self.node_byxs = node_byxs
+        self.node_feats = node_feats
+        self.node_labels = node_labels
+        self.adj = adj
+        
+        self.gnn_feat_dropout = gnn_feat_dropout
+        self.gnn_att_dropout = gnn_att_dropout
+        
+        self.var_to_restore += layer_name_list
+        
+        print("GAT part built.")
+        
+    def build_infer_module(self):
+        """Build the inference module."""
+        print("Building the inference module...")
+        # please note that all layers/variables related to the inference module
+        # are prefixed with 'post_cnn' instead of 'infer_module'
 
-        gnn_final_feats = tf.squeeze(h_1, [0]) # [num_nodes, last_hidden_dim]
+        post_cnn_dropout = tf.compat.v1.placeholder_with_default(0., shape=())
+        
+        is_lr_flipped = tf.compat.v1.placeholder(tf.bool, [])
+        is_ud_flipped = tf.compat.v1.placeholder(tf.bool, [])
+        rot90_num = tf.compat.v1.placeholder_with_default(0., shape=())
+        
+        y_len = tf.cast(tf.compat.v1.ceil(tf.divide(tf.cast(tf.slice(tf.shape(self.imgs),[1],[1]), tf.float32),self.win_size)), dtype=tf.int32)
+        x_len = tf.cast(tf.compat.v1.ceil(tf.divide(tf.cast(tf.slice(tf.shape(self.imgs),[2],[1]), tf.float32),self.win_size)), dtype=tf.int32)
+        
+        sp_size = tf.cond(tf.logical_or(tf.equal(rot90_num,0), tf.equal(rot90_num,2)), \
+                          lambda: tf.concat(values=[y_len,x_len], axis=0), \
+                          lambda: tf.concat(values=[x_len,y_len], axis=0))
+            
+        reshaped_gnn_feats = tf.reshape(tensor=self.gnn_final_feats, \
+                                        shape=tf.concat(values=[tf.slice(tf.shape(self.imgs),[0],[1]), \
+                                                                sp_size, \
+                                                                tf.slice(tf.shape(self.gnn_final_feats),[1],[1])], axis=0))
+        
+        reshaped_gnn_feats = tf.cond(is_lr_flipped, \
+            lambda: tf.image.flip_left_right(reshaped_gnn_feats) , \
+            lambda: reshaped_gnn_feats)
+        
+        reshaped_gnn_feats = tf.cond(is_ud_flipped, \
+            lambda: tf.image.flip_up_down(reshaped_gnn_feats) , \
+            lambda: reshaped_gnn_feats)
+        
+        reshaped_gnn_feats = tf.cond(tf.math.not_equal(rot90_num,0), \
+            lambda: tf.image.rot90(reshaped_gnn_feats, tf.cast(rot90_num, tf.int32)), \
+            lambda: reshaped_gnn_feats)
+                                                    
+        temp_num_chs = self.params.gat_n_heads[-2]*self.params.gat_hid_units[-1]
 
-        return node_feats, node_logits, gnn_final_feats
-
-    def _run_infer_module(self, gnn_final_feats, imgs_shape,
-                          is_lr_flipped, is_ud_flipped, rot90_num,
-                          post_cnn_dropout=0., training=True):
-        """Chạy mô-đun suy luận."""
-
-        y_len = tf.cast(tf.math.ceil(tf.cast(imgs_shape[1], tf.float32) / self.win_size), dtype=tf.int32)
-        x_len = tf.cast(tf.math.ceil(tf.cast(imgs_shape[2], tf.float32) / self.win_size), dtype=tf.int32)
-
-        sp_size = tf.cond(tf.logical_or(tf.equal(rot90_num, 0), tf.equal(rot90_num, 2)),
-                          lambda: tf.stack([y_len, x_len]),
-                          lambda: tf.stack([x_len, y_len]))
-
-        reshaped_gnn_feats = tf.reshape(
-            tensor=gnn_final_feats,
-            shape=tf.concat([
-                [imgs_shape[0]], sp_size, [tf.shape(gnn_final_feats)[-1]]
-            ], axis=0)
-        )
-
-        # Đảo ngược (TTA)
-        if is_lr_flipped:
-            reshaped_gnn_feats = tf.image.flip_left_right(reshaped_gnn_feats)
-        if is_ud_flipped:
-            reshaped_gnn_feats = tf.image.flip_up_down(reshaped_gnn_feats)
-        if tf.math.not_equal(rot90_num, 0):
-            reshaped_gnn_feats = tf.image.rot90(reshaped_gnn_feats, k=tf.cast(rot90_num, tf.int32))
-
-        # Chạy lớp nén
-        current_input = reshaped_gnn_feats
-        for layer in self.post_cnn_conv_comp_layers:
-            if layer is not None:
-                current_input = layer(current_input, training=training)
-
-        ds_rate = self.win_size // 2
-        while ds_rate >= 1:
-            ds_rate_int = int(ds_rate)
-
-            # Upsample (Deconv)
-            upsampled = current_input
-            for layer in self.post_cnn_deconv_layers[ds_rate_int]:
-                if layer is not None:
-                    # Lớp Conv2DTranspose cần output_shape động
-                    if isinstance(layer, layers.Conv2DTranspose):
-                        target_shape = tf.concat([
-                            [imgs_shape[0]],
-                            self.cnn_feat_spatial_sizes[ds_rate_int],
-                            [16] # num_channels
-                        ], axis=0)
-                        # Lưu ý: output_shape không còn được hỗ trợ trực tiếp trong TF2 Keras
-                        # Thay vào đó, chúng ta dựa vào strides và padding.
-                        # Mã gốc đã sử dụng output_shape, điều này hơi rắc rối.
-                        # Chúng ta sẽ giả định strides=2 và padding='same' là đủ.
-                        upsampled = layer(upsampled, training=training)
-                    else:
-                        upsampled = layer(upsampled, training=training)
-
-            # Skip connection
-            cur_cnn_feat = self.cnn_feat[ds_rate_int]
-            if post_cnn_dropout > 0.:
-                cur_cnn_feat = tf.nn.dropout(cur_cnn_feat, 1.0 - post_cnn_dropout)
-
-            for layer in self.post_cnn_skip_layers[ds_rate_int]:
-                if layer is not None:
-                    cur_cnn_feat = layer(cur_cnn_feat, training=training)
-
-            # Fuse
-            fused_input = tf.concat(values=[upsampled, cur_cnn_feat], axis=3)
-            output = fused_input
-            for layer in self.post_cnn_fuse_layers[ds_rate_int]:
-                if layer is not None:
-                    output = layer(output, training=training)
-
-            current_input = output
-            ds_rate = ds_rate / 2
-
-        post_cnn_img_output = current_input
-        post_cnn_img_fg_prob = tf.sigmoid(post_cnn_img_output)
-
-        return post_cnn_img_output, post_cnn_img_fg_prob
-
-    def call(self, inputs, training=True):
-        """
-        Thực hiện lượt chạy thuận hoàn chỉnh.
-        'inputs' là một dict chứa tất cả (trước đây là placeholders).
-        """
-        imgs = inputs['imgs']
-        node_byxs = inputs['node_byxs']
-        adj = inputs['adj']
-
-        # TTA và dropout inputs
-        gnn_feat_dropout = inputs.get('gnn_feat_dropout', 0.0) if training else 0.0
-        gnn_att_dropout = inputs.get('gnn_att_dropout', 0.0) if training else 0.0
-        post_cnn_dropout = inputs.get('post_cnn_dropout', 0.0) if training else 0.0
-        is_lr_flipped = inputs.get('is_lr_flipped', False)
-        is_ud_flipped = inputs.get('is_ud_flipped', False)
-        rot90_num = inputs.get('rot90_num', 0)
-
-        # 1. Chạy CNN
-        conv_feats, img_output, img_fg_prob = self._run_cnn_module(imgs)
-
-        # 2. Chạy GAT
-        node_feats, node_logits, gnn_final_feats = self._run_gat_module(
-            conv_feats, node_byxs, adj, gnn_feat_dropout, gnn_att_dropout
-        )
-
-        # 3. Chạy Module suy luận
-        post_cnn_img_output, post_cnn_img_fg_prob = self._run_infer_module(
-            gnn_final_feats, tf.shape(imgs),
-            is_lr_flipped, is_ud_flipped, rot90_num,
-            post_cnn_dropout, training=training
-        )
-
-        # Trả về tất cả các đầu ra cần thiết cho việc tính loss và metrics
-        return {
-            'img_output': img_output,
-            'img_fg_prob': img_fg_prob,
-            'node_logits': node_logits,
-            'node_feats': node_feats,
-            'gnn_final_feats': gnn_final_feats,
-            'post_cnn_img_output': post_cnn_img_output,
-            'post_cnn_img_fg_prob': post_cnn_img_fg_prob
-        }
-
-    def compute_loss_and_metrics(self, outputs, data):
-        """Tính toán tất cả các loss và metrics."""
-
-        labels = data['labels']
-        fov_masks = data['fov_masks']
-        node_labels = data['node_labels']
-        pixel_weights = data['pixel_weights'] # Trọng số cho post_cnn_loss
-
-        img_output = outputs['img_output']
-        img_fg_prob = outputs['img_fg_prob']
-        node_logits = outputs['node_logits']
-        post_cnn_img_output = outputs['post_cnn_img_output']
-        post_cnn_img_fg_prob = outputs['post_cnn_img_fg_prob']
-
-        flat_labels = tf.reshape(tensor=labels, shape=(-1,))
-        flat_labels_float = tf.cast(flat_labels, tf.float32)
-        flat_labels_bool = tf.cast(flat_labels, tf.bool)
-
-        binary_mask_fg = tf.cast(tf.equal(labels, 1), tf.float32)
-        binary_mask_bg = tf.cast(tf.not_equal(labels, 1), tf.float32)
-        combined_mask = tf.concat(values=[binary_mask_bg, binary_mask_fg], axis=3)
-        flat_one_hot_labels = tf.reshape(tensor=combined_mask, shape=(-1, 2))
-
-        num_pixel_in_fov = tf.reduce_sum(fov_masks)
-        num_pixel_fg_64 = tf.math.count_nonzero(binary_mask_fg, dtype=tf.int64)
-        num_pixel_fg = tf.cast(num_pixel_fg_64, tf.float32)
-        num_pixel_bg = tf.cast(num_pixel_in_fov, tf.float32) - num_pixel_fg
-
-        safe_num_pixel_in_fov = tf.add(tf.cast(num_pixel_in_fov, tf.float32), cfg.EPSILON)
-
-        weight_fg = tf.divide(num_pixel_bg, safe_num_pixel_in_fov)
-        weight_bg = tf.divide(num_pixel_fg, safe_num_pixel_in_fov)
-
-        class_weight = tf.cast(tf.stack([weight_bg, weight_fg]), dtype=tf.float32)
-        weight_per_label = tf.reduce_sum(flat_one_hot_labels * class_weight, axis=1)
-
-        reshaped_fov_masks = tf.reshape(tensor=tf.cast(fov_masks, tf.float32), shape=(-1,))
-        safe_mean_fov = tf.add(tf.reduce_mean(reshaped_fov_masks), cfg.EPSILON)
-        reshaped_fov_masks_norm = reshaped_fov_masks / safe_mean_fov
-
-        losses = {}
-        metrics = {}
-
-        # 1. CNN Loss & Metrics
-        flat_logits_cnn = tf.reshape(tensor=img_output, shape=(-1,))
-        cross_entropies_cnn = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=flat_logits_cnn, labels=flat_labels_float
-        )
-        weighted_loss_cnn = tf.multiply(reshaped_fov_masks_norm, weight_per_label)
-        losses['cnn'] = tf.reduce_mean(tf.multiply(weighted_loss_cnn, cross_entropies_cnn))
-
-        flat_bin_output_cnn = tf.greater_equal(tf.reshape(tensor=img_fg_prob, shape=(-1,)), 0.5)
-        metrics['cnn_accuracy'] = tf.reduce_mean(tf.cast(tf.equal(flat_bin_output_cnn, flat_labels_bool), tf.float32))
-        num_fg_output_cnn = tf.reduce_sum(tf.cast(flat_bin_output_cnn, tf.float32))
-        tp_cnn = tf.reduce_sum(tf.cast(tf.logical_and(flat_labels_bool, flat_bin_output_cnn), tf.float32))
-        metrics['cnn_precision'] = tf.divide(tp_cnn, tf.add(num_fg_output_cnn, cfg.EPSILON))
-        metrics['cnn_recall'] = tf.divide(tp_cnn, tf.add(num_pixel_fg, cfg.EPSILON))
-        metrics['cnn_tp'] = tp_cnn
-        metrics['cnn_num_fg_output'] = num_fg_output_cnn
-        metrics['num_pixel_fg'] = num_pixel_fg # Chung
-
-        # 2. GNN Loss & Metrics
-        cross_entropies_gnn = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=node_logits, labels=node_labels
-        )
-        num_node = tf.size(node_labels)
-        num_node_fg = tf.cast(tf.math.count_nonzero(node_labels, dtype=tf.int32), tf.float32)
-        num_node_bg = tf.cast(num_node, tf.float32) - num_node_fg
-        safe_num_node = tf.add(tf.cast(num_node, tf.float32), cfg.EPSILON)
-
-        gnn_weight_fg = tf.divide(num_node_bg, safe_num_node)
-        gnn_weight_bg = tf.divide(num_node_fg, safe_num_node)
-
-        gnn_class_weight = tf.cast(tf.stack([gnn_weight_bg, gnn_weight_fg]), dtype=tf.float32)
-        gnn_one_hot = tf.one_hot(tf.cast(node_labels, tf.int32), 2)
-        gnn_weight_per_label = tf.reduce_sum(gnn_one_hot * gnn_class_weight, axis=1)
-
-        losses['gnn'] = tf.reduce_mean(tf.multiply(gnn_weight_per_label, cross_entropies_gnn))
-
-        gnn_prob = tf.sigmoid(node_logits)
-        gnn_correct = tf.equal(tf.cast(tf.greater_equal(gnn_prob, 0.5), tf.int32), tf.cast(node_labels, tf.int32))
-        metrics['gnn_accuracy'] = tf.reduce_mean(tf.cast(gnn_correct, tf.float32))
-
-        # 3. Post-CNN (Inference) Loss & Metrics
-        flat_logits_post_cnn = tf.reshape(tensor=post_cnn_img_output, shape=(-1,))
-        cross_entropies_post_cnn = tf.nn.sigmoid_cross_entropy_with_logits(
-            logits=flat_logits_post_cnn, labels=flat_labels_float
-        )
-        reshaped_pixel_weights = tf.reshape(tensor=pixel_weights, shape=(-1,))
-        safe_mean_pixel_weights = tf.add(tf.reduce_mean(reshaped_pixel_weights), cfg.EPSILON)
-        reshaped_pixel_weights_norm = reshaped_pixel_weights / safe_mean_pixel_weights
-
-        weighted_loss_post_cnn = tf.multiply(reshaped_pixel_weights_norm, weight_per_label)
-        losses['post_cnn'] = tf.reduce_mean(tf.multiply(weighted_loss_post_cnn, cross_entropies_post_cnn))
-
-        flat_bin_output_post_cnn = tf.greater_equal(tf.reshape(tensor=post_cnn_img_fg_prob, shape=(-1,)), 0.5)
-        metrics['post_cnn_accuracy'] = tf.reduce_mean(tf.cast(tf.equal(flat_bin_output_post_cnn, flat_labels_bool), tf.float32))
-        num_fg_output_post_cnn = tf.reduce_sum(tf.cast(flat_bin_output_post_cnn, tf.float32))
-        tp_post_cnn = tf.reduce_sum(tf.cast(tf.logical_and(flat_labels_bool, flat_bin_output_post_cnn), tf.float32))
-        metrics['post_cnn_precision'] = tf.divide(tp_post_cnn, tf.add(num_fg_output_post_cnn, cfg.EPSILON))
-        metrics['post_cnn_recall'] = tf.divide(tp_post_cnn, tf.add(num_pixel_fg, cfg.EPSILON))
-        metrics['post_cnn_tp'] = tp_post_cnn
-        metrics['post_cnn_num_fg_output'] = num_fg_output_post_cnn
-
-        # 4. Total Loss
-        total_loss = losses['post_cnn']
-        if self.cnn_loss_on:
-            total_loss += losses['cnn']
-
-        # Thêm L2
-        total_loss_with_l2 = total_loss + tf.add_n(self.losses)
-
-        # GNN loss được xử lý riêng trong train_step
-
-        losses['total'] = total_loss
-        losses['total_with_l2'] = total_loss_with_l2
-
-        metrics.update(losses)
-        return losses, metrics
-
-    def _process_gradients(self, grads_and_vars_1, grads_and_vars_2):
-        """Xử lý gradient phức tạp cho VGN."""
-
-        # Xử lý GNN Grads (grads_and_vars_2)
-        processed_gvs_2 = []
-        if self.gnn_loss_on:
-            for g, v in grads_and_vars_2:
-                if g is None:
-                    processed_gvs_2.append((g, v))
-                    continue
-
-                if 'gat' in v.name:
-                    g = tf.clip_by_value(g, -5., 5.)
-                else:
-                    g = None # Chỉ cập nhật trọng số GAT
-                processed_gvs_2.append((g, v))
-        else:
-            processed_gvs_2 = [(None, v) for g, v in grads_and_vars_2]
-
-        # Kết hợp Grads
-        combined_gvs = []
-        for (g1, v1), (g2, v2) in zip(grads_and_vars_1, processed_gvs_2):
-            assert v1.name == v2.name
-            combined_g = add_tensors_wo_none([g1, g2])
-            combined_gvs.append((combined_g, v1))
-
-        # Xử lý Combined Grads
-        final_gvs = []
-        lr_ratio = self.params.new_net_lr / (self.params.old_net_ft_lr + cfg.EPSILON)
-
-        for g, v in combined_gvs:
-            if g is None:
-                final_gvs.append((g, v))
-                continue
-
-            # old_net_ft_lr == 0: Chỉ cập nhật mạng mới
-            if self.params.old_net_ft_lr == 0:
-                is_new_net = ('gat' in v.name or 'post_cnn' in v.name)
-                if self.params.do_simul_training and is_new_net:
-                    g = tf.clip_by_value(g, -5., 5.)
-                elif 'post_cnn' in v.name: # Không huấn luyện GAT
-                    g = tf.clip_by_value(g, -5., 5.)
-                else:
-                    g = None # Đóng băng mạng cũ
-
-            # old_net_ft_lr > 0: Huấn luyện toàn bộ
+        post_cnn_conv_comp = self.new_conv_layer(reshaped_gnn_feats, [1,1,temp_num_chs,32], norm_type=self.params.norm_type, use_relu=True, name='post_cnn_conv_comp') # changed
+        current_input = post_cnn_conv_comp
+        ds_rate = self.win_size/2
+        while ds_rate>=1:
+            
+            cur_deconv_name = 'post_cnn_deconv%d'%(ds_rate)
+            upsampled = self.new_deconv_layer(current_input, [4,4,16,32], \
+                                              tf.concat(values=[tf.slice(tf.shape(self.imgs),[0],[1]), \
+                                                                self.cnn_feat_spatial_sizes[ds_rate], \
+                                                                tf.constant(16,shape=[1,])], axis=0), \
+                                              [1,2,2,1], norm_type=self.params.norm_type, use_relu=True, name=cur_deconv_name)
+            
+            cur_cnn_feat = tf.nn.dropout(self.cnn_feat[ds_rate], 1-post_cnn_dropout)
+            if self.params.use_enc_layer: 
+                cur_cnn_feat = self.new_conv_layer(cur_cnn_feat, [1,1,16,16], \
+                                                   norm_type=self.params.norm_type, use_relu=True, name='post_cnn_cnn_feat%d'%(ds_rate)) # added
             else:
-                is_new_net = ('gat' in v.name or 'post_cnn' in v.name)
-                if self.params.do_simul_training and is_new_net:
-                    g = g * lr_ratio
-                elif 'post_cnn' in v.name: # Không huấn luyện GAT
-                    g = g * lr_ratio
+                if self.params.norm_type=='BN':
+                    #cur_cnn_feat = tf.compat.v1.layers.batch_normalization(cur_cnn_feat, training=is_training, renorm=cfg.USE_BRN)
+                    pass
+                elif self.params.norm_type=='GN':
+                    cur_cnn_feat = self.group_norm_layer(cur_cnn_feat, num_group=min(cfg.GN_MIN_NUM_G, 16/cfg.GN_MIN_CHS_PER_G), name='post_cnn_cnn_feat%d'%(ds_rate))
+                    cur_cnn_feat = tf.nn.relu(cur_cnn_feat)
+                else:
+                    pass
 
-                g = tf.clip_by_value(g, -5., 5.)
+            if ds_rate==1:
+                cur_conv_name = 'post_cnn_img_output'
+                output = self.new_conv_layer(tf.concat(values=[upsampled,cur_cnn_feat], axis=3), \
+                                             [self.infer_module_kernel_size,self.infer_module_kernel_size,32,1], \
+                                             name=cur_conv_name) # changed
+                self.post_cnn_img_output = output
+            else:
+                cur_conv_name = 'post_cnn_conv%d'%(ds_rate)
+                output = self.new_conv_layer(tf.concat(values=[upsampled,cur_cnn_feat], axis=3), \
+                                             [self.infer_module_kernel_size,self.infer_module_kernel_size,32,32], \
+                                             norm_type=self.params.norm_type, use_relu=True, name=cur_conv_name) # changed
+            
+            current_input = output
+            ds_rate = ds_rate/2
 
-            if g is not None and 'post_cnn' in v.name:
-                g = g * self.params.infer_module_grad_weight
+        post_cnn_img_fg_prob = tf.sigmoid(current_input)
+        
+        pixel_weights = tf.compat.v1.placeholder(tf.float32, [None, None, None, 1], name='pixel_weights')
+        
+        ### Hang up the results ###     
+        self.post_cnn_dropout = post_cnn_dropout
+        
+        self.pixel_weights = pixel_weights
+        self.post_cnn_img_fg_prob = post_cnn_img_fg_prob
+        
+        self.is_lr_flipped = is_lr_flipped
+        self.is_ud_flipped = is_ud_flipped
+        self.rot90_num = rot90_num
+        self.reshaped_gnn_feats = reshaped_gnn_feats
+        
+        print("inference module built.")
+        
+    def build_optimizer(self):
+        """Build the optimizer."""
+        print("Building the optimizer part...")
+        
+        ###### cnn related ######
+        
+        ### Compute the loss ###
+        binary_mask_fg = tf.compat.v1.to_float(tf.equal(self.labels, 1))
+        binary_mask_bg = tf.compat.v1.to_float(tf.not_equal(self.labels, 1))
+        combined_mask = tf.concat(values=[binary_mask_bg,binary_mask_fg], axis=3)
+        flat_one_hot_labels = tf.reshape(tensor=combined_mask, shape=(-1, 2))
+        flat_labels = tf.reshape(tensor=self.labels, shape=(-1,))
+        flat_logits = tf.reshape(tensor=self.img_output, shape=(-1,))
+        cross_entropies = tf.nn.sigmoid_cross_entropy_with_logits(logits=flat_logits, labels=tf.compat.v1.to_float(flat_labels))
+        
+        """# weighted cross entropy loss (in/out fov)
+        num_pixel = tf.size(self.labels)
+        num_pixel_fg = tf.compat.v1.count_nonzero(binary_mask_fg, dtype=tf.int32)
+        num_pixel_bg = num_pixel - num_pixel_fg
+        class_weight = tf.cast(tf.concat(values=[tf.reshape(tf.divide(num_pixel_fg,num_pixel),(1,1)), \
+                                                tf.reshape(tf.divide(num_pixel_bg,num_pixel),(1,1))], axis=1), dtype=tf.float32)
+        weight_per_label = tf.transpose(tf.matmul(flat_one_hot_labels,tf.transpose(class_weight))) #shape [1, TRAIN.BATCH_SIZE]
+        # this is the weight for each datapoint, depending on its label
+        cnn_loss = tf.reduce_mean(tf.multiply(weight_per_label,cross_entropies))"""
+        
+        # weighted cross entropy loss (in fov)
+        num_pixel = tf.reduce_sum(self.fov_masks)
+        num_pixel_fg = tf.compat.v1.count_nonzero(binary_mask_fg, dtype=tf.int64)
+        num_pixel_bg = num_pixel - num_pixel_fg
+        class_weight = tf.cast(tf.concat(values=[tf.reshape(tf.divide(num_pixel_fg,num_pixel),(1,1)), \
+                                                tf.reshape(tf.divide(num_pixel_bg,num_pixel),(1,1))], axis=1), dtype=tf.float32)
+        weight_per_label = tf.transpose(tf.matmul(flat_one_hot_labels,tf.transpose(class_weight))) #shape [1, TRAIN.BATCH_SIZE]
+        # this is the weight for each datapoint, depending on its label
+        reshaped_fov_masks = tf.reshape(tensor=tf.cast(self.fov_masks, tf.float32), shape=(-1,))
+        reshaped_fov_masks /= tf.reduce_mean(reshaped_fov_masks)
+        cnn_loss = tf.reduce_mean(tf.multiply(tf.multiply(reshaped_fov_masks, weight_per_label), cross_entropies))
+        
+        ### Compute the accuracy ###
+        flat_bin_output = tf.greater_equal(tf.reshape(tensor=self.img_fg_prob, shape=(-1,)), 0.5)
+        # accuracy
+        cnn_correct = tf.compat.v1.to_float(tf.equal(flat_bin_output,tf.cast(flat_labels, tf.bool)))
+        cnn_accuracy = tf.reduce_mean(cnn_correct)
+        # precision, recall
+        num_fg_output = tf.reduce_sum(tf.compat.v1.to_float(flat_bin_output)) 
+        cnn_tp = tf.reduce_sum(tf.compat.v1.to_float(tf.logical_and(tf.cast(flat_labels, dtype=tf.bool), flat_bin_output)))
+        cnn_pre = tf.divide(cnn_tp,tf.add(num_fg_output,cfg.EPSILON))
+        cnn_rec = tf.divide(cnn_tp,tf.compat.v1.to_float(num_pixel_fg))
 
-            final_gvs.append((g, v))
 
-        return final_gvs
+        ###### gnn related ######
 
-    # Ghi đè train_step
-    def train_step(self, data):
-        with tf.GradientTape(persistent=True) as tape:
-            # Chạy thuận
-            outputs = self(data, training=True)
+        ### Compute the loss ###
+        gnn_cross_entropies = tf.nn.sigmoid_cross_entropy_with_logits(logits=self.node_logits, labels=self.node_labels)
+        
+        # simple cross entropy loss
+        #gnn_loss = tf.reduce_mean(gnn_cross_entropies)
+        # weighted cross entropy loss
+        num_node = tf.size(self.node_labels)
+        num_node_fg = tf.compat.v1.count_nonzero(self.node_labels, dtype=tf.int32)
+        num_node_bg = num_node - num_node_fg
+        gnn_class_weight = tf.cast(tf.concat(values=[tf.reshape(tf.divide(num_node_fg,num_node),(1,1)), \
+                                                     tf.reshape(tf.divide(num_node_bg,num_node),(1,1))], axis=1), dtype=tf.float32)
+        gnn_weight_per_label = tf.transpose(tf.matmul(tf.one_hot(tf.cast(self.node_labels, tf.int32), 2), tf.transpose(gnn_class_weight))) #shape [1, TRAIN.BATCH_SIZE]
+        # this is the weight for each datapoint, depending on its label
+        gnn_loss = tf.reduce_mean(tf.multiply(gnn_weight_per_label,gnn_cross_entropies))
 
-            # Tính loss
-            losses, metrics = self.compute_loss_and_metrics(outputs, data)
+        ### Compute the accuracy ###
+        gnn_prob = tf.sigmoid(self.node_logits)
+        gnn_correct = tf.equal(tf.cast(tf.greater_equal(gnn_prob, 0.5), tf.int32), tf.cast(self.node_labels, tf.int32))
+        gnn_accuracy = tf.reduce_mean(tf.cast(gnn_correct, tf.float32))
+        
+        
+        ###### inference module related ######
+        
+        ### Compute the loss ###
+        post_cnn_flat_logits = tf.reshape(tensor=self.post_cnn_img_output, shape=(-1,))
+        post_cnn_cross_entropies = tf.nn.sigmoid_cross_entropy_with_logits(logits=post_cnn_flat_logits, labels=tf.compat.v1.to_float(flat_labels))
+        
+        # weighted cross entropy loss
+        reshaped_pixel_weights = tf.reshape(tensor=self.pixel_weights, shape=(-1,))
+        reshaped_pixel_weights /= tf.reduce_mean(reshaped_pixel_weights)
+        post_cnn_loss = tf.reduce_mean(tf.multiply(tf.multiply(reshaped_pixel_weights, weight_per_label), post_cnn_cross_entropies))
+        
+        ### Compute the accuracy ###
+        post_cnn_flat_bin_output = tf.greater_equal(tf.reshape(tensor=self.post_cnn_img_fg_prob, shape=(-1,)), 0.5)
+        # accuracy
+        post_cnn_correct = tf.compat.v1.to_float(tf.equal(post_cnn_flat_bin_output,tf.cast(flat_labels, tf.bool)))
+        post_cnn_accuracy = tf.reduce_mean(post_cnn_correct)
+        # precision, recall
+        post_cnn_num_fg_output = tf.reduce_sum(tf.compat.v1.to_float(post_cnn_flat_bin_output))
+        post_cnn_tp = tf.reduce_sum(tf.compat.v1.to_float(tf.logical_and(tf.cast(flat_labels, dtype=tf.bool), post_cnn_flat_bin_output)))
+        post_cnn_pre = tf.divide(post_cnn_tp,tf.add(post_cnn_num_fg_output,cfg.EPSILON))
+        post_cnn_rec = tf.divide(post_cnn_tp,tf.compat.v1.to_float(num_pixel_fg))
 
-            loss_1 = losses['total_with_l2'] # CNN + Post-CNN
-            loss_2 = losses['gnn'] * self.gnn_loss_weight # GNN
+        ###### joint optimization ######
+        
+        if self.cnn_loss_on:
+            loss = tf.add_n([cnn_loss, post_cnn_loss])
+        else:
+            loss = post_cnn_loss
+        
+        weights_only = filter( lambda x: x.name.endswith('W:0'), tf.compat.v1.trainable_variables() )
+        weight_decay = tf.reduce_sum(tf.stack([tf.nn.l2_loss(x) for x in weights_only])) * cfg.TRAIN.WEIGHT_DECAY_RATE
+        loss += weight_decay
+        
+        ### Build the solver ###
+        learning_rate = tf.compat.v1.placeholder(tf.float32, shape=[])
+        if self.params.opt=='adam':
+            optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate, epsilon=0.1)
+        elif self.params.opt=='sgd':
+            optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate, cfg.TRAIN.MOMENTUM, use_nesterov=True)
 
-        trainable_vars = self.trainable_variables
+        grads_and_vars_1 = optimizer.compute_gradients(loss)
+        if self.gnn_loss_on:
+            grads_and_vars_2 = optimizer.compute_gradients(gnn_loss*self.gnn_loss_weight)
+            grads_and_vars_2 = map(lambda gv: (tf.clip_by_value(gv[0], -5., 5.),gv[1]) \
+                                   if (('gat' in gv[1].name) and (gv[0] is not None)) \
+                                   else (None,gv[1]), grads_and_vars_2)
+            grads_and_vars = map(lambda gv_tuple: (add_tensors_wo_none([gv_tuple[0][0],gv_tuple[1][0]]), gv_tuple[0][1]), list(zip(grads_and_vars_1,grads_and_vars_2)))     
+        else:
+            grads_and_vars = grads_and_vars_1
+            
+        if self.params.old_net_ft_lr==0:
+            # update only the newly added sub-network
+            if self.params.lr_scheduling=='pc':
+                boundaries = [int(self.params.max_iters*self.params.lr_decay_tp)]
+                values = [self.params.new_net_lr,self.params.new_net_lr*0.1]            
+                lr_handler = tf.compat.v1.train.piecewise_constant(self.global_step, boundaries, values)
+            else:
+                raise NotImplementedError
+                
+            if self.params.do_simul_training:
+                grads_and_vars = map(lambda gv: (tf.clip_by_value(gv[0], -5., 5.),gv[1]) \
+                                     if (('gat' in gv[1].name or 'post_cnn' in gv[1].name) and (gv[0] is not None)) \
+                                     else (None,gv[1]), grads_and_vars)
+            else:
+                grads_and_vars = map(lambda gv: (tf.clip_by_value(gv[0], -5., 5.),gv[1]) if (('post_cnn' in gv[1].name) and (gv[0] is not None)) \
+                                     else (None,gv[1]), grads_and_vars)
+                
+            grads_and_vars = map(lambda gv: (gv[0]*self.params.infer_module_grad_weight,gv[1]) \
+                                 if 'post_cnn' in gv[1].name \
+                                 else (gv[0],gv[1]), grads_and_vars)     
+                
+            train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)    
+        else:
+            # update the whole network
+            if self.params.lr_scheduling=='pc':
+                boundaries = [int(self.params.max_iters*self.params.lr_decay_tp)]
+                values = [self.params.old_net_ft_lr,self.params.old_net_ft_lr*0.1]         
+                lr_handler = tf.compat.v1.train.piecewise_constant(self.global_step, boundaries, values)
+            else:
+                raise NotImplementedError
 
-        # Tính gradients cho cả hai loss
-        grads_1 = tape.gradient(loss_1, trainable_vars)
-        grads_2 = tape.gradient(loss_2, trainable_vars)
+            lr_ratio = self.params.new_net_lr/self.params.old_net_ft_lr
+            if self.params.do_simul_training:
+                grads_and_vars = map(lambda gv: (lr_ratio*gv[0],gv[1]) \
+                                     if (('gat' in gv[1].name or 'post_cnn' in gv[1].name) and (gv[0] is not None)) \
+                                     else (gv[0],gv[1]), grads_and_vars)
+            else:
+                grads_and_vars = map(lambda gv: (lr_ratio*gv[0],gv[1]) \
+                                     if (('post_cnn' in gv[1].name) and (gv[0] is not None)) \
+                                     else (gv[0],gv[1]), grads_and_vars)
+            
+            grads_and_vars = map(lambda gv: (tf.clip_by_value(gv[0], -5., 5.),gv[1]) \
+                                 if gv[0] is not None \
+                                 else (gv[0],gv[1]), grads_and_vars)
+            
+            grads_and_vars = map(lambda gv: (gv[0]*self.params.infer_module_grad_weight,gv[1]) \
+                                 if 'post_cnn' in gv[1].name \
+                                 else (gv[0],gv[1]), grads_and_vars)  
+            
+            train_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step)
 
-        del tape # Xóa tape
+        ### Hang up the results ###  
+        self.cnn_flat_bin_output = flat_bin_output
+        self.cnn_loss = cnn_loss
+        self.cnn_tp = cnn_tp
+        self.cnn_num_fg_output = num_fg_output
+        self.cnn_num_pixel_fg = num_pixel_fg
+        self.cnn_accuracy = cnn_accuracy
+        self.cnn_precision = cnn_pre        
+        self.cnn_recall = cnn_rec
+        
+        self.gnn_prob = gnn_prob
+        self.gnn_loss = gnn_loss
+        self.gnn_accuracy = gnn_accuracy
+        
+        self.post_cnn_flat_bin_output = post_cnn_flat_bin_output
+        self.post_cnn_loss = post_cnn_loss
+        self.post_cnn_tp = post_cnn_tp
+        self.post_cnn_num_fg_output = post_cnn_num_fg_output
+        self.post_cnn_accuracy = post_cnn_accuracy
+        self.post_cnn_precision = post_cnn_pre        
+        self.post_cnn_recall = post_cnn_rec
 
-        grads_and_vars_1 = list(zip(grads_1, trainable_vars))
-        grads_and_vars_2 = list(zip(grads_2, trainable_vars))
+        self.learning_rate = learning_rate
+        self.lr_handler = lr_handler
 
-        # Xử lý gradients
-        final_grads_and_vars = self._process_gradients(grads_and_vars_1, grads_and_vars_2)
+        self.loss = loss
+        self.train_op = train_op
 
-        # Áp dụng gradients
-        self.optimizer.apply_gradients(final_grads_and_vars)
-
-        # Trả về metrics
-        return metrics
-
-    # Ghi đè test_step
-    def test_step(self, data):
-        # Chạy thuận
-        outputs = self(data, training=False)
-
-        # Tính loss và metrics
-        losses, metrics = self.compute_loss_and_metrics(outputs, data)
-
-        return metrics
+        print("optimizer part built.")
