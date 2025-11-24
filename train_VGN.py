@@ -517,11 +517,11 @@ if __name__ == '__main__':
                     cur_cnn_fg_prob_map = reshaped_cnn_fg_prob_map[j,:,:]
                     cur_infer_module_fg_prob_map = reshaped_infer_module_fg_prob_mat[j,:,:]
                 
-                    cur_map = (cur_cnn_fg_prob_map*255).astype(int)
+                    cur_map = (cur_cnn_fg_prob_map*255).astype(np.uint8)
                     cur_save_path = res_save_path + cur_img_name + '_prob_cnn.png'
                     skimage.io.imsave(cur_save_path, cur_map)
                     
-                    cur_map = (cur_infer_module_fg_prob_map*255).astype(int)
+                    cur_map = (cur_infer_module_fg_prob_map*255).astype(np.uint8)
                     cur_save_path = res_save_path + cur_img_name + '_prob_infer_module.png'
                     skimage.io.imsave(cur_save_path, cur_map)
             
