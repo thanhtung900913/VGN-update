@@ -301,7 +301,7 @@ def _get_graph_fov_blob(minibatch_db, is_training, edge_type='srns_geo_dist_bina
         len_y = 592
         len_x = 592
     elif 'STARE' in minibatch_db[0]:
-        im_root_path = '/content/data/STARE/images'
+        im_root_path = '../STARE/all'
         im_ext = '.ppm'
         label_ext = '.ah.ppm'
         fov_ext = '_mask.png'
@@ -388,11 +388,11 @@ def _get_graph_fov_blob(minibatch_db, is_training, edge_type='srns_geo_dist_bina
         n_nodes_in_graph = union_graph.number_of_nodes()
         
         """if vec_aug_on[0]:
-            for j in range(n_nodes_in_graph):
+            for j in xrange(n_nodes_in_graph):
                 union_graph.nodes[j]['x'] = label.shape[1]-union_graph.nodes[j]['x']-1
                 
         if vec_aug_on[1]:
-            for j in range(n_nodes_in_graph):
+            for j in xrange(n_nodes_in_graph):
                 union_graph.nodes[j]['y'] = label.shape[0]-union_graph.nodes[j]['y']-1"""            
         
         if vec_aug_on[4]:
@@ -727,8 +727,8 @@ def visualize_graph(im, graph, show_graph=False, save_graph=True, \
             if not (graph.number_of_nodes()==np.sum(num_nodes_each_type)):
                 raise ValueError('Wrong number of nodes')
             node_color = [VIS_NODE_COLOR[0]]*num_nodes_each_type[0] + [VIS_NODE_COLOR[1]]*num_nodes_each_type[1] 
-    if show_graph:
-        nx.draw(graph, pos, node_color='green', edge_color='blue', width=1, node_size=10, alpha=VIS_ALPHA)
+
+    nx.draw(graph, pos, node_color='green', edge_color='blue', width=1, node_size=10, alpha=VIS_ALPHA)
     #nx.draw(graph, pos, node_color='darkgreen', edge_color='black', width=3, node_size=30, alpha=VIS_ALPHA)
     #nx.draw(graph, pos, node_color=node_color, node_size=VIS_NODE_SIZE, alpha=VIS_ALPHA)
     

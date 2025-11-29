@@ -11,7 +11,8 @@ import multiprocessing
 import skfmm
 import skimage.transform
 import tensorflow as tf
-
+from tqdm import tqdm
+tf.compat.v1.disable_eager_execution()
 from config import cfg
 from model import vessel_segm_vgn
 import util
@@ -77,7 +78,14 @@ def parse_args():
     
 def make_graph_using_srns(args):
     fg_prob_map, edge_type, win_size, edge_geo_dist_thresh, img_path = args
-
+    # Xác định tên file graph sẽ lưu
+    savepath = img_path+'_%.2d_%.2d'%(win_size,edge_geo_dist_thresh)+'.graph_res'
+    
+    # Kiểm tra nếu file đã tồn tại thì bỏ qua luôn
+    if os.path.exists(savepath):
+        print(f'Graph already exists for {img_path}, skipping generation.')
+        return 
+    # ---------------------------
     if 'srns' not in edge_type:
         raise NotImplementedError
     
@@ -109,33 +117,45 @@ def make_graph_using_srns(args):
     # add nodes
     for node_idx, (node_y, node_x) in enumerate(max_pos):
         graph.add_node(node_idx, kind='MP', y=node_y, x=node_x, label=node_idx)
-        print('node label', node_idx, 'pos', (node_y,node_x), 'added')
+        # print('node label', node_idx, 'pos', (node_y,node_x), 'added')
 
     speed = vesselness
 
     node_list = list(graph.nodes)
-    for i, n in enumerate(node_list): 
+    for i, n in enumerate(tqdm(node_list, desc=os.path.basename(img_path), leave=False)): 
             
         phi = np.ones_like(speed)
-        phi[graph.node[n]['y'],graph.node[n]['x']] = -1
-        if speed[graph.node[n]['y'],graph.node[n]['x']]==0:
+        
+        # --- SỬA LỖI TẠI ĐÂY: graph.node -> graph.nodes ---
+        phi[int(graph.nodes[n]['y']), int(graph.nodes[n]['x'])] = -1
+        
+        if speed[int(graph.nodes[n]['y']), int(graph.nodes[n]['x'])] == 0:
             continue
 
-        neighbor = speed[max(0,graph.node[n]['y']-1):min(im_y,graph.node[n]['y']+2), \
-                         max(0,graph.node[n]['x']-1):min(im_x,graph.node[n]['x']+2)]
+        y_n = int(graph.nodes[n]['y'])
+        x_n = int(graph.nodes[n]['x'])
+        neighbor = speed[max(0, y_n-1):min(im_y, y_n+2), 
+                         max(0, x_n-1):min(im_x, x_n+2)]
+        # --------------------------------------------------
+        # print('neighbor mean speed:', np.mean(neighbor))
         if np.mean(neighbor)<0.1:
+
             continue
                
         tt = skfmm.travel_time(phi, speed, narrow=edge_geo_dist_thresh) # travel time
 
         for n_comp in node_list[i+1:]:
-            geo_dist = tt[graph.node[n_comp]['y'],graph.node[n_comp]['x']] # travel time
+            # --- SỬA LỖI TẠI ĐÂY NỮA ---
+            y_comp = int(graph.nodes[n_comp]['y'])
+            x_comp = int(graph.nodes[n_comp]['x'])
+            geo_dist = tt[y_comp, x_comp] # travel time
+            # ---------------------------
+            
             if geo_dist < edge_geo_dist_thresh:
                 graph.add_edge(n, n_comp, weight=edge_geo_dist_thresh/(edge_geo_dist_thresh+geo_dist))
-                print('An edge BTWN', 'node', n, '&', n_comp, 'is constructed')
+                # print('An edge BTWN', 'node', n, '&', n_comp, 'is constructed')
      
     # save as a file
-    savepath = img_path+'_%.2d_%.2d'%(win_size,edge_geo_dist_thresh)+'.graph_res'
     nx.write_gpickle(graph, savepath, protocol=pkl.HIGHEST_PROTOCOL)
     graph.clear()
     print('generated a graph for '+img_path)
@@ -185,16 +205,102 @@ if __name__ == '__main__':
     
     network = vessel_segm_vgn(args, None)
 
-    config = tf.ConfigProto()
+    config = tf.compat.v1.ConfigProto()
     config.gpu_options.allow_growth = True  
-    sess = tf.InteractiveSession(config=config)
+    sess = tf.compat.v1.InteractiveSession(config=config)
     
-    saver = tf.train.Saver()
+    saver = tf.compat.v1.train.Saver()
     
-    sess.run(tf.global_variables_initializer())
+    sess.run(tf.compat.v1.global_variables_initializer())
+    # ==============================================================================
+    # [START] DEEP INSPECTION: KIỂM TRA TOÀN BỘ LAYER
+    # ==============================================================================
+    print("\n" + "="*80)
+    print(">>> BẮT ĐẦU KIỂM TRA SÂU QUÁ TRÌNH LOAD MODEL")
+    print("="*80)
+
+    # 1. Lấy danh sách tất cả biến cần train và biến global (để check cả batch norm, step...)
+    # Lọc bỏ các biến của Optimizer (Adam, Momentum...) vì khi test không cần load chúng
+    all_vars = [v for v in tf.compat.v1.global_variables() if 'Optimizer' not in v.name and 'Adam' not in v.name and 'Momentum' not in v.name]
+    
+    # 2. Lưu giá trị trước khi load (Snapshot Before)
+    print("... Đang chụp trạng thái biến TRƯỚC khi load...")
+    values_before = sess.run({v.name: v for v in all_vars})
+    
+    # 3. Load Model
+    if args.model_path is not None:
+        print(f">>> Đang load model từ: {args.model_path}")
+        try:
+            saver.restore(sess, args.model_path)
+        except Exception as e:
+            print(f"!!! LỖI FATAL KHI LOAD: {e}")
+            exit()
+    else:
+        print("!!! CẢNH BÁO: Không có đường dẫn model!")
+
+    # 4. Lưu giá trị sau khi load (Snapshot After)
+    print("... Đang chụp trạng thái biến SAU khi load...")
+    values_after = sess.run({v.name: v for v in all_vars})
+
+    # 5. So sánh và Báo cáo
+    loaded_vars = []
+    not_loaded_vars = []
+    
+    print("\n" + "-"*80)
+    print(f"{'TÊN BIẾN (LAYER)':<50} | {'TRẠNG THÁI':<15} | {'CHI TIẾT (Diff)'}")
+    print("-"*80)
+
+    for v in all_vars:
+        name = v.name
+        val_b = values_before[name]
+        val_a = values_after[name]
+        
+        # Tính sự khác biệt tổng thể
+        diff = np.sum(np.abs(val_a - val_b))
+        
+        # Nếu diff > 0 nghĩa là giá trị đã thay đổi -> Đã load thành công
+        # (Trừ trường hợp hy hữu random ra trùng nhau, nhưng tỉ lệ gần bằng 0)
+        if diff > 0.000001: 
+            status = "✅ ĐÃ LOAD"
+            loaded_vars.append(name)
+            print(f"{name:<50} | {status:<15} | Diff: {diff:.4f}")
+        else:
+            # Nếu giá trị y hệt -> Chưa load (vẫn dùng giá trị khởi tạo ngẫu nhiên)
+            status = "❌ CHƯA LOAD"
+            not_loaded_vars.append(name)
+            # In màu đỏ hoặc cảnh báo rõ
+            print(f"{name:<50} | {status:<15} | !!! GIÁ TRỊ KHÔNG ĐỔI")
+
+    print("-"*80)
+    print(f">>> TỔNG KẾT:")
+    print(f"   - Tổng số biến trong mạng: {len(all_vars)}")
+    print(f"   - Số biến load thành công: {len(loaded_vars)}")
+    print(f"   - Số biến KHÔNG load được: {len(not_loaded_vars)}")
+
+    if len(not_loaded_vars) > 0:
+        print("\n!!! CẢNH BÁO: CÁC BIẾN SAU ĐÂY ĐANG CHẠY VỚI GIÁ TRỊ NGẪU NHIÊN (RANDOM):")
+        for v_name in not_loaded_vars:
+            print(f"   - {v_name}")
+        print(">>> GỢI Ý: Kiểm tra lại tên biến trong file model.py xem có khớp với file checkpoint không.")
+        print("           Sử dụng tf.train.list_variables(args.model_path) để xem tên trong file ckpt.")
+    else:
+        print("\n>>> TUYỆT VỜI: TOÀN BỘ MẠNG ĐÃ ĐƯỢC LOAD ĐÚNG!")
+
+    print("="*80 + "\n")
+    # ==============================================================================
+    # [END] DEEP INSPECTION
+    # ==============================================================================
     if args.model_path is not None:
         print("Loading model...")
         saver.restore(sess, args.model_path)
+        # --- THÊM ĐOẠN NÀY ĐỂ KIỂM TRA ---
+        g_step = sess.run(network.global_step)
+        print(f"DEBUG CHECK: Global Step = {g_step}")
+        if g_step == 0:
+            print(">>> CẢNH BÁO: Model chưa được nạp! (Global step vẫn là 0)")
+        else:
+            print(f">>> OK: Model đã nạp thành công từ checkpoint (Step {g_step})")
+        # ---------------------------------
     
     f_log = open(os.path.join(res_save_path,'log.txt'), 'w')
     f_log.write(str(args)+'\n')
@@ -272,16 +378,77 @@ if __name__ == '__main__':
     for img_idx in range(len(res_list)):
         temp_fg_prob_map = res_list[img_idx]['final_fg_prob_map']
         func_arg.append((temp_fg_prob_map, args.edge_type, args.win_size, args.edge_geo_dist_thresh, res_list[img_idx]['img_path']))
+    
+    print("Generating graphs...")
     if args.use_multiprocessing:    
-            pool.map(make_graph_using_srns, func_arg)
+            list(tqdm(pool.imap(make_graph_using_srns, func_arg), total=len(func_arg)))
     else:
-        for x in func_arg:
+        for x in tqdm(func_arg):
             make_graph_using_srns(x)
     
     # load graphs
     for img_idx in range(len(res_list)):
         loadpath = res_list[img_idx]['img_path']+'_%.2d_%.2d'%(args.win_size,args.edge_geo_dist_thresh)+'.graph_res'
         temp_graph = nx.read_gpickle(loadpath)
+        # ==========================================================
+        # [START] KIỂM TRA NGUYÊN NHÂN 1: THỨ TỰ KHÔNG GIAN (SPATIAL ORDER)
+        # ==========================================================
+        print(f"\n>>> DEBUG SPATIAL ORDER: {os.path.basename(res_list[img_idx]['img_path'])}")
+        
+        # 1. Kiểm tra số lượng node
+        # Tính toán kích thước lưới kỳ vọng dựa trên ảnh và win_size
+        img_h, img_w = res_list[img_idx]['img'].shape[1:3]
+        expected_rows = int(np.ceil(img_h / args.win_size))
+        expected_cols = int(np.ceil(img_w / args.win_size))
+        expected_nodes = expected_rows * expected_cols
+        
+        actual_nodes = temp_graph.number_of_nodes()
+        print(f"   - Ảnh input: {img_h}x{img_w}")
+        print(f"   - Lưới kỳ vọng: {expected_rows}x{expected_cols} (Win_size={args.win_size})")
+        print(f"   - Số Node kỳ vọng: {expected_nodes}")
+        print(f"   - Số Node thực tế: {actual_nodes}")
+        
+        if actual_nodes != expected_nodes:
+            print(f"   🔴 LỖI NGHIÊM TRỌNG: Số lượng Node không khớp! (Thừa/Thiếu {actual_nodes - expected_nodes} node)")
+            print("   -> tf.reshape sẽ bị crash hoặc dồn pixel sai vị trí.")
+        else:
+            print("   ✅ Số lượng Node khớp.")
+
+        # 2. Kiểm tra Trực quan (Visual Check)
+        # Tạo một ảnh map để xem Node 0, 1, 2... đang nằm ở đâu trên ảnh
+        # Nếu đúng: Nó phải tạo thành gradient mượt từ trên-trái xuống dưới-phải.
+        node_order_map = np.zeros((img_h, img_w), dtype=np.float32)
+        
+        # Mapping index
+        sorted_nodes = sorted(list(temp_graph.nodes)) # Giả sử index là 0, 1, 2...
+        
+        is_order_correct = True
+        prev_idx = -1
+        
+        # Chỉ kiểm tra 10 node đầu xem có liên tiếp không
+        print("   - Kiểm tra tọa độ 5 node đầu tiên (Kỳ vọng: tăng dần theo hàng):")
+        for i in range(min(5, len(sorted_nodes))):
+            n = sorted_nodes[i]
+            y, x = int(temp_graph.nodes[n]['y']), int(temp_graph.nodes[n]['x'])
+            print(f"     + Node {n}: (y={y}, x={x})")
+            
+            # Vẽ lên map (mỗi node là một ô vuông sáng dần)
+            # Giá trị pixel = index của node
+            val = i / actual_nodes 
+            # Vẽ to ra một chút để dễ nhìn (bằng win_size)
+            y_start, x_start = max(0, y - args.win_size//2), max(0, x - args.win_size//2)
+            node_order_map[y_start:y_start+args.win_size, x_start:x_start+args.win_size] = val
+
+        # Lưu ảnh debug ra để bạn xem
+        debug_path = f"debug_spatial_{img_idx}.png"
+        skimage.io.imsave(debug_path, (node_order_map*255).astype(np.uint8))
+        print(f"   -> Đã lưu ảnh kiểm tra thứ tự tại: {debug_path}")
+        print("   -> Hãy mở ảnh này. Nếu thấy các ô vuông xếp đều đặn từ trái qua phải: OK.")
+        print("   -> Nếu thấy chấm đen/trắng nhảy lung tung: LỖI THỨ TỰ.")
+        
+        # ==========================================================
+        # [END] DEBUG
+        # ==========================================================
         res_list[img_idx]['graph'] = temp_graph
         
     # make final results 
@@ -353,14 +520,14 @@ if __name__ == '__main__':
         img_path = res_list[img_idx]['img_path']
         temp = img_path[util.find(img_path,'/')[-1]:]
                 
-        temp_output = (cur_pred*255).astype(int)
+        temp_output = (cur_pred*255).astype(np.uint8)
         cur_save_path = res_save_path + temp + '_prob_final.png'
         skimage.io.imsave(cur_save_path, temp_output)
         
         cur_save_path = res_save_path + temp + '.npy'
         np.save(cur_save_path, cur_pred)
         
-        temp_output = ((1.-cur_pred)*255).astype(int)
+        temp_output = ((1.-cur_pred)*255).astype(np.uint8)
         cur_save_path = res_save_path + temp + '_prob_final_inv.png'
         skimage.io.imsave(cur_save_path, temp_output)
         # save qualitative results

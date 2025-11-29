@@ -618,17 +618,47 @@ class vessel_segm_vgn(base_model):
         self.build_model()
         
     # special layer for graph attention network
+    # Helper function để tạo conv1d thủ công
+    def manual_conv1d(self, inputs, filters, kernel_size, name, use_bias=True):
+        with tf.compat.v1.variable_scope(name):
+            # Lấy số kênh đầu vào (input channels)
+            in_channels = inputs.get_shape().as_list()[-1]
+            
+            # Tạo biến kernel: shape [kernel_size, in_channels, out_filters]
+            kernel = tf.compat.v1.get_variable("kernel", 
+                                             shape=[kernel_size, in_channels, filters],
+                                             initializer=tf.compat.v1.glorot_uniform_initializer())
+            
+            # Thực hiện phép tích chập
+            output = tf.compat.v1.nn.conv1d(inputs, kernel, stride=1, padding='SAME')
+            
+            # Thêm bias nếu cần
+            if use_bias:
+                bias = tf.compat.v1.get_variable("bias", 
+                                               shape=[filters], 
+                                               initializer=tf.compat.v1.zeros_initializer())
+                output = tf.nn.bias_add(output, bias)
+            
+            return output
+
+    # special layer for graph attention network
     def sp_attn_head(self, bottom, output_size, adj, name, act=tf.nn.elu, feat_dropout=0., att_dropout=0., residual=False, show_adj=False):
        
         with tf.compat.v1.variable_scope(name) as scope:
             if feat_dropout != 0.0:
                 bottom = tf.nn.dropout(bottom, 1.0 - feat_dropout)
     
-            fts = tf.keras.layers.Conv1D(output_size, 1, use_bias=False)(bottom)
-    
-            # simplest self-attention possible
-            f_1 = tf.keras.layers.Conv1D(1, 1)(fts)
-            f_2 = tf.keras.layers.Conv1D(1, 1)(fts)
+            # --- SỬA LỖI: Dùng hàm thủ công thay vì tf.layers hay keras ---
+            
+            # 1. Feature Transformation (tương ứng conv1d trong checkpoint)
+            # Checkpoint gốc layer này KHÔNG có bias (use_bias=False)
+            fts = self.manual_conv1d(bottom, output_size, 1, name='conv1d', use_bias=False)
+            
+            # 2. Attention Mechanism (tương ứng conv1d_1, conv1d_2)
+            # Checkpoint gốc các layer này CÓ bias (mặc định tf.layers cũ là True)
+            f_1 = self.manual_conv1d(fts, 1, 1, name='conv1d_1', use_bias=True)
+            f_2 = self.manual_conv1d(fts, 1, 1, name='conv1d_2', use_bias=True)
+            # -------------------------------------------------------------
             
             num_nodes = tf.slice(tf.shape(adj),[0],[1])
             f_1 = tf.reshape(f_1, tf.concat(values=[num_nodes,tf.constant(1,shape=[1,])], axis=0))
@@ -655,18 +685,22 @@ class vessel_segm_vgn(base_model):
             vals = tf.compat.v1.sparse_tensor_dense_matmul(coefs, fts)
             vals = tf.expand_dims(vals, axis=0)
             vals = tf.reshape(vals, tf.concat(values=[tf.constant(1,shape=[1,]),num_nodes,tf.constant(output_size,shape=[1,])], axis=0))
-            bias = tf.Variable(tf.zeros([output_size]), name="bias")
-            ret = tf.nn.bias_add(vals, bias)
+            
+            # BiasAdd scope (Giữ nguyên vì đã khớp checkpoint)
+            with tf.compat.v1.variable_scope("BiasAdd"):
+                biases = tf.compat.v1.get_variable("biases", [output_size], 
+                                                 initializer=tf.compat.v1.zeros_initializer())
+            ret = tf.nn.bias_add(vals, biases)
     
             # residual connection
             if residual:
                 if bottom.shape[-1] != ret.shape[-1]:
-                    ret = ret + tf.keras.layers.Conv1D(ret.shape[-1], 1)(bottom) # activation
+                    # Sửa cả phần residual dùng hàm thủ công
+                    ret = ret + self.manual_conv1d(bottom, ret.shape[-1], 1, name='residual_conv', use_bias=True)
                 else:
                     ret = ret + bottom
     
         if show_adj:
-            #return act(ret), tf.sparse_reshape(lrelu, tf.concat(values=[num_nodes,num_nodes], axis=0))
             return act(ret), coefs
         else:
             return act(ret)
