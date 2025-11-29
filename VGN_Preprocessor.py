@@ -11,7 +11,7 @@ import networkx as nx
 import pickle as pkl
 import tensorflow as tf
 from pathlib import Path
-
+from tqdm import tqdm  # Thêm dòng này
 tf.compat.v1.disable_eager_execution()
 
 from model import vessel_segm_vgn
@@ -83,16 +83,20 @@ def build_graph_from_probmap(probmap, win_size=4, geo_thresh=10):
     y_quan = sorted(list(set(range(0, H, win_size)) | set([H])))
     x_quan = sorted(list(set(range(0, W, win_size)) | set([W])))
 
+    # === Tìm local maxima trong từng ô (nhanh) ===
     max_pos = []
     for y_idx in range(len(y_quan)-1):
         for x_idx in range(len(x_quan)-1):
             cur_patch = probmap[y_quan[y_idx]:y_quan[y_idx+1], x_quan[x_idx]:x_quan[x_idx+1]]
             if np.sum(cur_patch) == 0:
-                max_pos.append((y_quan[y_idx] + cur_patch.shape[0]/2, x_quan[x_idx] + cur_patch.shape[1]/2))
+                cy = y_quan[y_idx] + cur_patch.shape[0]/2
+                cx = x_quan[x_idx] + cur_patch.shape[1]/2
+                max_pos.append((cy, cx))
             else:
-                temp = np.unravel_index(cur_patch.argmax(), cur_patch.shape)
-                max_pos.append((y_quan[y_idx] + temp[0], x_quan[x_idx] + temp[1]))
+                ty, tx = np.unravel_index(cur_patch.argmax(), cur_patch.shape)
+                max_pos.append((y_quan[y_idx] + ty, x_quan[x_idx] + tx))
 
+    # Tạo node
     G = nx.Graph()
     for node_idx, (ny, nx_) in enumerate(max_pos):
         G.add_node(node_idx, y=int(round(ny)), x=int(round(nx_)))
@@ -100,36 +104,41 @@ def build_graph_from_probmap(probmap, win_size=4, geo_thresh=10):
     vesselness = probmap
     im_y, im_x = vesselness.shape
     node_list = list(G.nodes)
-    for i, n in enumerate(node_list):
-        phi = np.ones_like(vesselness)
-        ny = int(G.nodes[n]['y'])
-        nx_ = int(G.nodes[n]['x'])
+    total_nodes = len(node_list)
+
+    print(f"   Building edges for {total_nodes} nodes...")
+
+    # === Vòng lặp chính: thêm progress bar + tối ưu hiển thị ===
+    for i in tqdm(range(total_nodes), desc="   Graph edges", leave=False, ncols=100):
+        n = node_list[i]
+        ny, nx_ = G.nodes[n]['y'], G.nodes[n]['x']
+
         if ny < 0 or ny >= im_y or nx_ < 0 or nx_ >= im_x:
             continue
-        phi[ny, nx_] = -1
         if vesselness[ny, nx_] == 0:
             continue
 
-        # travel time (skfmm)
+        phi = np.ones_like(vesselness)
+        phi[ny, nx_] = -1
+
         try:
             tt = skfmm.travel_time(phi, vesselness, narrow=geo_thresh)
         except Exception:
-            # fallback: use euclidean distance if skfmm fails
             tt = np.full_like(vesselness, np.inf, dtype=float)
             for j in node_list[i+1:]:
-                yy = int(G.nodes[j]['y'])
-                xx = int(G.nodes[j]['x'])
+                yy, xx = G.nodes[j]['y'], G.nodes[j]['x']
                 tt[yy, xx] = np.sqrt((yy - ny)**2 + (xx - nx_)**2)
 
+        # Chỉ duyệt các node phía sau để tránh lặp lại
         for n_comp in node_list[i+1:]:
-            yy = int(G.nodes[n_comp]['y'])
-            xx = int(G.nodes[n_comp]['x'])
+            yy, xx = G.nodes[n_comp]['y'], G.nodes[n_comp]['x']
             geo_dist = tt[yy, xx]
             if geo_dist < geo_thresh:
-                # weight same as train_VGN
-                G.add_edge(n, n_comp, weight=geo_thresh/(geo_thresh + geo_dist))
-    return G
+                weight = geo_thresh / (geo_thresh + geo_dist)
+                G.add_edge(n, n_comp, weight=weight)
 
+    print(f"   Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    return G
 
 def robust_restore(sess, saver, ckpt_path):
     try:

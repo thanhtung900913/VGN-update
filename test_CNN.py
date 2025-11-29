@@ -1,15 +1,12 @@
-# -*- coding: utf-8 -*-
-"""
-Updated for modern Python (3.8+) and TensorFlow 1.x / TF2 compatibility mode
-Original: coded by syshin
-Updated by: Grok (2025)
-"""
+# coded by syshin
 
-import os
-import argparse
 import numpy as np
+import os
+import pdb
 import skimage.io
+import argparse
 import tensorflow as tf
+tf.compat.v1.disable_eager_execution()
 
 from config import cfg
 from model import vessel_segm_cnn
@@ -17,225 +14,240 @@ import util
 
 
 def parse_args():
+    """
+    Parse input arguments
+    """
     parser = argparse.ArgumentParser(description='Test a vessel_segm_cnn network')
-    parser.add_argument('--dataset', default='DRIVE', type=str,
-                        help='Dataset to use: DRIVE | STARE | CHASE_DB1')
-    parser.add_argument('--cnn_model', default='driu', type=str,
-                        help='CNN model to use')
-    parser.add_argument('--use_fov_mask', default=True, type=lambda x: (str(x).lower() == 'true'),
-                        help='Whether to use FOV masks')
-    parser.add_argument('--model_path', default='../models/DRIVE/DRIU*/DRIU_DRIVE.ckpt', type=str,
-                        help='Path to the .ckpt model to load')
-    parser.add_argument('--save_root', default='DRIU_DRIVE', type=str,
-                        help='Root folder to save test results')
+    parser.add_argument('--dataset', default='DRIVE', help='Dataset to use: Can be DRIVE or STARE or CHASE_DB1', type=str)
+    parser.add_argument('--cnn_model', default='driu', help='CNN model to use', type=str)
+    parser.add_argument('--use_fov_mask', default=True, help='Whether to use fov masks', type=bool)
+    parser.add_argument('--opt', default='adam', help='Optimizer to use: Can be sgd or adam', type=str) # declared but not used
+    parser.add_argument('--lr', default=1e-02, help='Learning rate to use: Can be any floating point number', type=float) # declared but not used
+    parser.add_argument('--lr_decay', default='pc', help='Learning rate decay to use: Can be pc or exp', type=str) # declared but not used
+    parser.add_argument('--max_iters', default=50000, help='Maximum number of iterations', type=int) # declared but not used
+    parser.add_argument('--model_path', default='../models/DRIVE/DRIU*/DRIU_DRIVE.ckpt', help='path for a model(.ckpt) to load', type=str)
+    parser.add_argument('--save_root', default='DRIU_DRIVE', help='root path to save test results', type=str)
 
-    # Các tham số training không dùng trong test → vẫn giữ để tương thích
-    parser.add_argument('--opt', default='adam', type=str)
-    parser.add_argument('--lr', default=1e-2, type=float)
-    parser.add_argument('--lr_decay', default='pc', type=str)
-    parser.add_argument('--max_iters', default=50000, type=int)
-
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
 
 if __name__ == '__main__':
+    
     args = parse_args()
+    
     print('Called with args:')
     print(args)
-
-    # ------------------------------------------------------------------ #
-    # Choose dataset paths
-    # ------------------------------------------------------------------ #
-    if args.dataset == 'DRIVE':
+    
+    if args.dataset=='DRIVE':
         train_set_txt_path = cfg.TRAIN.DRIVE_SET_TXT_PATH
         test_set_txt_path = cfg.TEST.DRIVE_SET_TXT_PATH
-    elif args.dataset == 'STARE':
-        train_set_txt_path = "/content/data/STARE/list/train.txt"
-        test_set_txt_path = "/content/data/STARE/list/test.txt"
-    elif args.dataset == 'CHASE_DB1':
+    elif args.dataset=='STARE':
+        train_set_txt_path = cfg.TRAIN.STARE_SET_TXT_PATH
+        test_set_txt_path = cfg.TEST.STARE_SET_TXT_PATH
+    elif args.dataset=='CHASE_DB1':
         train_set_txt_path = cfg.TRAIN.CHASE_DB1_SET_TXT_PATH
         test_set_txt_path = cfg.TEST.CHASE_DB1_SET_TXT_PATH
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}")
-
-    # Load image name lists
-    with open(train_set_txt_path, 'r') as f:
+    
+    with open(train_set_txt_path) as f:
         train_img_names = [x.strip() for x in f.readlines()]
-    with open(test_set_txt_path, 'r') as f:
+    with open(test_set_txt_path) as f:
         test_img_names = [x.strip() for x in f.readlines()]
-
-    # Data layers (training=False vì chỉ test)
+    
+    len_train = len(train_img_names) 
+    len_test = len(test_img_names)
+    
     data_layer_train = util.DataLayer(train_img_names, is_training=False)
     data_layer_test = util.DataLayer(test_img_names, is_training=False)
-
-    # Result saving path
-    res_save_path = os.path.join(args.save_root, cfg.TEST.RES_SAVE_PATH) if args.save_root else cfg.TEST.RES_SAVE_PATH
-    os.makedirs(res_save_path, exist_ok=True)
-
-    # ------------------------------------------------------------------ #
-    # Build network
-    # ------------------------------------------------------------------ #
+    
+    res_save_path = args.save_root + '/' + cfg.TEST.RES_SAVE_PATH if len(args.save_root)>0 else cfg.TEST.RES_SAVE_PATH
+    
+    if len(args.save_root)>0 and not os.path.isdir(args.save_root):  
+        os.mkdir(args.save_root)
+    if not os.path.isdir(res_save_path):   
+        os.mkdir(res_save_path) 
+    
     network = vessel_segm_cnn(args, None)
 
-    # TF session config
-    config = tf.ConfigProto() if hasattr(tf, 'ConfigProto') else tf.compat.v1.ConfigProto()
-    config.gpu_options.allow_growth = True
-
-    sess = tf.InteractiveSession(config=config)
-    saver = tf.train.Saver()
-
-    sess.run(tf.global_variables_initializer())
-
-    assert args.model_path and os.path.exists(args.model_path), f"Model not found: {args.model_path}"
-    print("Loading model from:", args.model_path)
+    config = tf.compat.v1.ConfigProto()
+    config.gpu_options.allow_growth = True    
+    sess = tf.compat.v1.InteractiveSession(config=config)
+    # saver = tf.compat.v1.train.Saver()  
+    variables_to_restore = tf.compat.v1.trainable_variables()
+    saver = tf.compat.v1.train.Saver(var_list=variables_to_restore)
+    sess.run(tf.compat.v1.global_variables_initializer())
+    
+    assert args.model_path, 'Model path is not available'  
+    print("Loading model...")
     saver.restore(sess, args.model_path)
 
-    # Log file
-    log_path = os.path.join(res_save_path, 'log.txt')
-    f_log = open(log_path, 'w')
-    f_log.write(args.model_path + '\n')
-
+    f_log = open(os.path.join(res_save_path,'log.txt'), 'w')
+    f_log.write(args.model_path+'\n')
     timer = util.Timer()
-
-    # ------------------------------------------------------------------ #
-    # 1. Run on training set (for qualitative results only)
-    # ------------------------------------------------------------------ #
-    for _ in range(int(np.ceil(len(train_img_names) / cfg.TRAIN.BATCH_SIZE))):
+    
+    train_loss_list = []
+    for _ in range(int(np.ceil(float(len_train)/cfg.TRAIN.BATCH_SIZE))):
+                
         timer.tic()
-        img_list, blobs = data_layer_train.forward()
-
-        img = blobs['img']
-        label = blobs['label']
-        fov_mask = blobs['fov'] if args.use_fov_mask else np.ones_like(label)
-
-        loss_val, fg_prob_map = sess.run(
-            [network.loss, network.fg_prob],
-            feed_dict={
-                network.is_training: False,
-                network.imgs: img,
-                network.labels: label,
-                network.fov_masks: fov_mask
-            })
-
-        timer.toc()
-
-        # Reshape for saving
-        batch_size = len(img_list)
-        fg_prob_map = fg_prob_map.reshape((batch_size, fg_prob_map.shape[1], fg_prob_map.shape[2]))
-
-        # Apply dataset-specific mask (DRIVE uses GIF mask)
-        if args.dataset == 'DRIVE':
-            mask_paths = [p + '_mask.gif' for p in img_list]
+        
+        # get one batch
+        img_list, blobs_train = data_layer_train.forward()
+        
+        img = blobs_train['img']
+        label = blobs_train['label']
+        if args.use_fov_mask:
+            fov_mask = blobs_train['fov']
         else:
-            mask_paths = [p + '_mask.tif' for p in img_list]
+            fov_mask = np.ones(label.shape, dtype=label.dtype)  
+        
+        loss_val, fg_prob_map = sess.run(
+        [network.loss, network.fg_prob],
+        feed_dict={
+            network.is_training: False,
+            network.imgs: img,
+            network.labels: label,
+            network.fov_masks: fov_mask
+            })
+    
+        timer.toc()
+        
+        #fg_prob_map = fg_prob_map*fov_mask.astype(float)
 
-        mask_stack = np.stack([skimage.io.imread(p) for p in mask_paths], axis=0)
-        mask_stack = (mask_stack.astype(np.float32) / 255) >= 0.5
-        fg_prob_map = fg_prob_map * mask_stack
+        train_loss_list.append(loss_val)
+            
+        # save qualitative results
+        cur_batch_size = len(img_list)
+        reshaped_fg_prob_map = fg_prob_map.reshape((cur_batch_size,fg_prob_map.shape[1],fg_prob_map.shape[2]))
+        if args.dataset=='DRIVE':
+            if args.dataset=='DRIVE':
+                mask = np.concatenate(map(lambda x: np.expand_dims(skimage.io.imread(x+'_mask.gif'), axis=0), img_list), axis=0)
+            else:
+                mask = np.concatenate(map(lambda x: np.expand_dims(skimage.io.imread(x+'_mask.tif'), axis=0), img_list), axis=0)
+            mask = ((mask.astype(float)/255)>=0.5).astype(float)
+            reshaped_fg_prob_map = reshaped_fg_prob_map*mask
+        reshaped_output = reshaped_fg_prob_map>=0.5    
+        for img_idx in range(cur_batch_size):
+            cur_test_img_path = img_list[img_idx]
+            temp_name = cur_test_img_path[util.find(cur_test_img_path,'/')[-1]+1:]
 
-        # Save images
-        pred_binary = (fg_prob_map >= 0.5).astype(np.uint8) * 255
-        for i in range(batch_size):
-            base_name = os.path.basename(img_list[i])
-            name_no_ext = os.path.splitext(base_name)[0]
+            cur_reshaped_fg_prob_map = (reshaped_fg_prob_map[img_idx,:,:]*255).astype(np.uint8)
+            cur_reshaped_output = (reshaped_output[img_idx,:,:].astype(np.uint8))*255
 
-            skimage.io.imsave(os.path.join(res_save_path, f"{name_no_ext}_prob.png"),
-                              (fg_prob_map[i] * 255).astype(np.uint8))
-            skimage.io.imsave(os.path.join(res_save_path, f"{name_no_ext}_output.png"),
-                              pred_binary[i])
-
-    # ------------------------------------------------------------------ #
-    # 2. Test set evaluation
-    # ------------------------------------------------------------------ #
+            cur_fg_prob_save_path = os.path.join(res_save_path, temp_name + '_prob.png')
+            cur_output_save_path = os.path.join(res_save_path, temp_name + '_output.png')
+            
+            skimage.io.imsave(cur_fg_prob_save_path, cur_reshaped_fg_prob_map)
+            skimage.io.imsave(cur_output_save_path, cur_reshaped_output)
+    
     test_loss_list = []
-    all_labels = np.zeros((0,), dtype=np.float32)
-    all_preds = np.zeros((0,), dtype=np.float32)
-    all_labels_roi = np.zeros((0,), dtype=np.float32)
-    all_preds_roi = np.zeros((0,), dtype=np.float32)
-
-    for _ in range(int(np.ceil(len(testImg_names) / cfg.TRAIN.BATCH_SIZE))):
+    all_cnn_labels = np.zeros((0,))
+    all_cnn_preds = np.zeros((0,))
+    all_cnn_labels_roi = np.zeros((0,))
+    all_cnn_preds_roi = np.zeros((0,))
+    for _ in range(int(np.ceil(float(len_test)/cfg.TRAIN.BATCH_SIZE))):
+                
         timer.tic()
-        img_list, blobs = data_layer_test.forward()
-
-        img = blobs['img']
-        label = blobs['label']
-        fov_mask = blobs['fov'] if args.use_fov_mask else np.ones_like(label)
+        
+        # get one batch
+        img_list, blobs_test = data_layer_test.forward()
+        
+        img = blobs_test['img']
+        label = blobs_test['label']     
+        if args.use_fov_mask:
+            fov_mask = blobs_test['fov']
+        else:
+            fov_mask = np.ones(label.shape, dtype=label.dtype)  
 
         loss_val, fg_prob_map = sess.run(
-            [network.loss, network.fg_prob],
-            feed_dict={
-                network.is_training: False,
-                network.imgs: img,
-                network.labels: label,
-                network.fov_masks: fov_mask
+        [network.loss, network.fg_prob],
+        feed_dict={
+            network.is_training: False,
+            network.imgs: img,
+            network.labels: label,
+            network.fov_masks: fov_mask
             })
+    
         timer.toc()
+        
+        #fg_prob_map = fg_prob_map*fov_mask.astype(float)
 
         test_loss_list.append(loss_val)
 
-        batch_size = len(img_list)
-        fg_prob_map = fg_prob_map.reshape((batch_size, fg_prob_map.shape[1], fg_prob_map.shape[2]))
+        all_cnn_labels = np.concatenate((all_cnn_labels,np.reshape(label, (-1))))
+        all_cnn_preds = np.concatenate((all_cnn_preds,np.reshape(fg_prob_map, (-1))))
+        
+        # save qualitative results
+        cur_batch_size = len(img_list)
+        reshaped_fg_prob_map = fg_prob_map.reshape((cur_batch_size,fg_prob_map.shape[1],fg_prob_map.shape[2]))
+        
+        if args.dataset=='DRIVE':
+            if args.dataset=='DRIVE':
+                mask = np.concatenate(map(lambda x: np.expand_dims(skimage.io.imread(x+'_mask.gif'), axis=0), img_list), axis=0)
+            else:
+                mask = np.concatenate(map(lambda x: np.expand_dims(skimage.io.imread(x+'_mask.tif'), axis=0), img_list), axis=0)
 
-        # Global scores (all pixels)
-        all_labels = np.concatenate((all_labels, label.ravel()))
-        all_preds = np.concatenate((all_preds, fg_prob_map.ravel()))
-
-        # ROI scores (only for DRIVE)
-        if args.dataset == 'DRIVE':
-            mask_paths = [p + '_mask.gif' for p in img_list]
+            mask = ((mask.astype(float)/255)>=0.5).astype(float)
+            label_roi = label[mask.astype(bool)]
+            fg_prob_map_roi = fg_prob_map[mask.astype(bool)]
+            all_cnn_labels_roi = np.concatenate((all_cnn_labels_roi,np.reshape(label_roi, (-1))))
+            all_cnn_preds_roi = np.concatenate((all_cnn_preds_roi,np.reshape(fg_prob_map_roi, (-1))))
+            reshaped_fg_prob_map = reshaped_fg_prob_map*mask
+            label = np.squeeze(label.astype(float), axis=-1)*mask
         else:
-            mask_paths = [p + '_mask.tif' for p in img_list]
+            label = np.squeeze(label.astype(float), axis=-1)
 
-        mask_stack = np.stack([skimage.io.imread(p) for p in mask_paths], axis=0)
-        mask_stack = (mask_stack.astype(np.float32) / 255) >= 0.5
+        reshaped_output = reshaped_fg_prob_map>=0.5
+        for img_idx in range(cur_batch_size):
+            cur_test_img_path = img_list[img_idx]
+            temp_name = cur_test_img_path[util.find(cur_test_img_path,'/')[-1]+1:]
+            
+            cur_reshaped_fg_prob_map = (reshaped_fg_prob_map[img_idx,:,:]*255).astype(np.uint8)
+            cur_reshaped_fg_prob_map_inv = ((1.-reshaped_fg_prob_map[img_idx,:,:])*255).astype(np.uint8)
+            cur_reshaped_output = (reshaped_output[img_idx,:,:].astype(np.uint8))*255
 
-        if args.dataset == 'DRIVE':
-            label_roi = label[mask_stack > 0]
-            pred_roi = fg_prob_map[mask_stack > 0]
-            all_labels_roi = np.concatenate((all_labels_roi, label_roi.ravel()))
-            all_preds_roi = np.concatenate((all_preds_roi, pred_roi.ravel()))
+            cur_fg_prob_save_path = os.path.join(res_save_path, temp_name + '_prob.png')
+            cur_fg_prob_inv_save_path = os.path.join(res_save_path, temp_name + '_prob_inv.png')
+            cur_output_save_path = os.path.join(res_save_path, temp_name + '_output.png')
+            cur_numpy_save_path = os.path.join(res_save_path, temp_name + '.npy')
+            
+            skimage.io.imsave(cur_fg_prob_save_path, cur_reshaped_fg_prob_map)
+            skimage.io.imsave(cur_fg_prob_inv_save_path, cur_reshaped_fg_prob_map_inv)
+            skimage.io.imsave(cur_output_save_path, cur_reshaped_output)
+            np.save(cur_numpy_save_path, reshaped_fg_prob_map[img_idx,:,:])
+                    
+    cnn_auc_test, cnn_ap_test = util.get_auc_ap_score(all_cnn_labels, all_cnn_preds)
+    all_cnn_labels_bin = np.copy(all_cnn_labels).astype(np.bool)
+    all_cnn_preds_bin = all_cnn_preds>=0.5
+    all_cnn_correct = all_cnn_labels_bin==all_cnn_preds_bin
+    cnn_acc_test = np.mean(all_cnn_correct.astype(np.float32))
+    
+    if args.dataset=='DRIVE':
+        cnn_auc_test_roi, cnn_ap_test_roi = util.get_auc_ap_score(all_cnn_labels_roi, all_cnn_preds_roi)
+        all_cnn_labels_bin_roi = np.copy(all_cnn_labels_roi).astype(np.bool)
+        all_cnn_preds_bin_roi = all_cnn_preds_roi>=0.5
+        all_cnn_correct_roi = all_cnn_labels_bin_roi==all_cnn_preds_bin_roi
+        cnn_acc_test_roi = np.mean(all_cnn_correct_roi.astype(np.float32))
+    
+    #print 'train_loss: %.4f'%(np.mean(train_loss_list))
+    print ('test_loss: %.4f'%(np.mean(test_loss_list)))
+    print ('test_cnn_acc: %.4f, test_cnn_auc: %.4f, test_cnn_ap: %.4f'%(cnn_acc_test, cnn_auc_test, cnn_ap_test))
+    if args.dataset=='DRIVE':
+        print ('test_cnn_acc_roi: %.4f, test_cnn_auc_roi: %.4f, test_cnn_ap_roi: %.4f'%(cnn_acc_test_roi, cnn_auc_test_roi, cnn_ap_test_roi))
+    
+    #f_log.write('train_loss '+str(np.mean(train_loss_list))+'\n')
+    f_log.write('test_loss '+str(np.mean(test_loss_list))+'\n')
+    f_log.write('test_cnn_acc '+str(cnn_acc_test)+'\n')
+    f_log.write('test_cnn_auc '+str(cnn_auc_test)+'\n')
+    f_log.write('test_cnn_ap '+str(cnn_ap_test)+'\n')
+    if args.dataset=='DRIVE':
+        f_log.write('test_cnn_acc_roi '+str(cnn_acc_test_roi)+'\n')
+        f_log.write('test_cnn_auc_roi '+str(cnn_auc_test_roi)+'\n')
+        f_log.write('test_cnn_ap_roi '+str(cnn_ap_test_roi)+'\n')
 
-        # Apply mask to probability maps before saving
-        fg_prob_map = fg_prob_map * mask_stack
-
-        # Save results
-        pred_binary = (fg_prob_map >= 0.5).astype(np.uint8) * 255
-        for i in range(batch_size):
-            base_name = os.path.basename(img_list[i])
-            name_no_ext = os.path.splitext(base_name)[0]
-
-            prob_uint8 = (fg_prob_map[i] * 255).astype(np.uint8)
-            skimage.io.imsave(os.path.join(res_save_path, f"{name_no_ext}_prob.png"), prob_uint8)
-            skimage.io.imsave(os.path.join(res_save_path, f"{name_no_ext}_prob_inv.png"), 255 - prob_uint8)
-            skimage.io.imsave(os.path.join(res_save_path, f"{name_no_ext}_output.png"), pred_binary[i])
-            np.save(os.path.join(res_save_path, f"{name_no_ext}.npy"), fg_prob_map[i])
-
-    # ------------------------------------------------------------------ #
-    # Final metrics
-    # ------------------------------------------------------------------ #
-    cnn_auc_test, cnn_ap_test = util.get_auc_ap_score(all_labels, all_preds)
-    cnn_acc_test = np.mean((all_labels >= 0.5) == (all_preds >= 0.5))
-
-    print(f'test_loss: {np.mean(test_loss_list):.6f}')
-    print(f'test_acc: {cnn_acc_test:.6f} | test_auc: {cnn_auc_test:.6f} | test_ap: {cnn_ap_test:.6f}')
-
-    if args.dataset == 'DRIVE':
-        cnn_auc_roi, cnn_ap_roi = util.get_auc_ap_score(all_labels_roi, all_preds_roi)
-        cnn_acc_roi = np.mean((all_labels_roi >= 0.5) == (all_preds_roi >= 0.5))
-        print(f'test_acc_roi: {cnn_acc_roi:.6f} | test_auc_roi: {cnn_auc_roi:.6f} | test_ap_roi: {cnn_ap_roi:.6f}')
-
-        f_log.write(f'test_cnn_acc_roi {cnn_acc_roi:.6f}\n')
-        f_log.write(f'test_cnn_auc_roi {cnn_auc_roi:.6f}\n')
-        f_log.write(f'test_cnn_ap_roi {cnn_ap_roi:.6f}\n')
-
-    # Write common metrics
-    f_log.write(f'test_loss {np.mean(test_loss_list):.6f}\n')
-    f_log.write(f'test_cnn_acc {cnn_acc_test:.6f}\n')
-    f_log.write(f'test_cnn_auc {cnn_auc_test:.6f}\n')
-    f_log.write(f'test_cnn_ap {cnn_ap_test:.6f}\n')
     f_log.flush()
+    
+    print ('speed: {:.3f}s'.format(timer.average_time))
+    
     f_log.close()
-
-    print(f'speed: {timer.average_time:.3f}s / batch')
     sess.close()
     print("Test complete.")

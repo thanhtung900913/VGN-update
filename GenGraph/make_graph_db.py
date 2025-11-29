@@ -229,7 +229,7 @@ if __name__ == '__main__':
         train_set_txt_path = '../../HRF/train_768.txt'
         test_set_txt_path = '../../HRF/test_768.txt'
         im_root_path = '../../HRF/all_768'
-        cnn_result_root_path = '../HRF_cnn/test' 
+        cnn_result_root_path = '../HRF_cnn/test'
     
     with open(train_set_txt_path) as f:
         train_img_names = [x.strip() for x in f.readlines()]
