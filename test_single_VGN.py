@@ -1,7 +1,3 @@
-# test_VGN_single.py
-# Inference VGN cho 1 ảnh duy nhất
-# Author: ChatGPT (2025)
-
 import argparse
 import numpy as np
 import skimage.io
