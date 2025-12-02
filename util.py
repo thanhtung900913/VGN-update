@@ -776,3 +776,21 @@ def get_node_byx_from_graph(graph, num_of_nodes_list):
         node_idx = node_idx+cur_num_nodes
     
     return node_byxs
+
+
+# [THÊM VÀO TEST_VGN.PY]
+import scipy.sparse as sp
+
+def preprocess_graph_gat_WEIGHTED(adj):
+    # Hàm này thay thế hàm trong util.py để hỗ trợ Weighted Graph
+    adj = sp.coo_matrix(adj)
+    adj = adj + sp.eye(adj.shape[0])  # Thêm self-loop (quan trọng)
+    
+    # --- [KHÁC BIỆT]: BỎ DÒNG adj[adj > 0.0] = 1.0 ---
+    # Chúng ta giữ nguyên giá trị trọng số (0.1, 0.5...)
+    
+    if not sp.isspmatrix_coo(adj):
+        adj = adj.tocoo()
+    adj = adj.astype(np.float32)
+    indices = np.vstack((adj.col, adj.row)).transpose()
+    return indices, adj.data, adj.shape

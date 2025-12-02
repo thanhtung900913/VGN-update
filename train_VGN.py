@@ -1,12 +1,3 @@
-# updated by syshin (180825)
-# do the following steps before running this script
-# (1) run the script 'GenGraph/make_graph_db.py'
-# to generate training/test graphs
-# (2) place the generated graphs ('.graph_res')
-# and cnn results ('_prob.png') in
-# a new directory 'args.save_root/graph'
-import tensorflow as tf
-tf.compat.v1.disable_eager_execution()
 import numpy as np
 import os
 import pdb
@@ -99,7 +90,7 @@ def restore_from_pretrained_model(sess, saver, network, pretrained_model_path):
     splits = pretrained_model_path.split('/')
     if ('DRIU*' in splits) or ('DRIU*' in splits) or ('DRIU*' in splits) or ('DRIU*' in splits):
         var_dict = {}
-        for v in tf.compat.v1.trainable_variables():
+        for v in tf.trainable_variables():
             t_var_name = v.name
             highest_level_name = t_var_name[:t_var_name.find('/')]
             if highest_level_name in network.var_to_restore:
@@ -111,14 +102,13 @@ def restore_from_pretrained_model(sess, saver, network, pretrained_model_path):
                 else:
                     var_dict[t_var_name[:t_var_name.rfind(':')]] = v
         
-        loader = tf.compat.v1.train.Saver(var_list=var_dict) 
+        loader = tf.train.Saver(var_list=var_dict) 
         loader.restore(sess, pretrained_model_path)
     else:
         saver.restore(sess, pretrained_model_path)
 
 
-def make_train_qual_res(params):
-    img_name, fg_prob_map, temp_graph_save_path, args = params
+def make_train_qual_res((img_name, fg_prob_map, temp_graph_save_path, args)):
 
     if 'srns' not in args.edge_type:
         raise NotImplementedError
@@ -127,7 +117,7 @@ def make_train_qual_res(params):
     
     cur_filename = img_name[util.find(img_name,'/')[-1]+1:]
     
-    print('regenerating a graph for '+cur_filename)
+    print 'regenerating a graph for '+cur_filename
                    
     temp = (fg_prob_map*255).astype(int)
     cur_save_path = os.path.join(temp_graph_save_path, cur_filename+'_prob.png')
@@ -147,8 +137,8 @@ def make_train_qual_res(params):
     
     max_val = []
     max_pos = []
-    for y_idx in range(len(y_quan)-1):
-        for x_idx in range(len(x_quan)-1):
+    for y_idx in xrange(len(y_quan)-1):
+        for x_idx in xrange(len(x_quan)-1):
             cur_patch = vesselness[y_quan[y_idx]:y_quan[y_idx+1],x_quan[x_idx]:x_quan[x_idx+1]]
             if np.sum(cur_patch)==0:
                 max_val.append(0)
@@ -163,7 +153,7 @@ def make_train_qual_res(params):
     # add nodes
     for node_idx, (node_y, node_x) in enumerate(max_pos):
         graph.add_node(node_idx, kind='MP', y=node_y, x=node_x, label=node_idx)
-        print('node label', node_idx, 'pos', (node_y,node_x), 'added')
+        print 'node label', node_idx, 'pos', (node_y,node_x), 'added'
 
     speed = vesselness
 
@@ -186,7 +176,7 @@ def make_train_qual_res(params):
             geo_dist = tt[graph.node[n_comp]['y'],graph.node[n_comp]['x']] # travel time
             if geo_dist < args.edge_geo_dist_thresh:
                 graph.add_edge(n, n_comp, weight=args.edge_geo_dist_thresh/(args.edge_geo_dist_thresh+geo_dist))
-                print('An edge BTWN', 'node', n, '&', n_comp, 'is constructed')
+                print 'An edge BTWN', 'node', n, '&', n_comp, 'is constructed'
      
     # save as files
     nx.write_gpickle(graph, cur_res_graph_savepath, protocol=pkl.HIGHEST_PROTOCOL)
@@ -206,7 +196,7 @@ if __name__ == '__main__':
         train_set_txt_path = cfg.TRAIN.DRIVE_SET_TXT_PATH
         test_set_txt_path = cfg.TEST.DRIVE_SET_TXT_PATH
     elif args.dataset=='STARE':
-        im_root_path = '/content/data/STARE/images'
+        im_root_path = '../STARE/all'
         train_set_txt_path = cfg.TRAIN.STARE_SET_TXT_PATH
         test_set_txt_path = cfg.TEST.STARE_SET_TXT_PATH
     elif args.dataset=='CHASE_DB1':
@@ -243,10 +233,10 @@ if __name__ == '__main__':
     len_test = len(test_img_names)
     
     # revise "train_img_names" and "test_img_names"
-    for i in range(len_train):
+    for i in xrange(len_train):
         temp = train_img_names[i] 
         train_img_names[i] = temp_graph_save_path + temp[util.find(temp,'/')[-1]:]
-    for i in range(len_test):
+    for i in xrange(len_test):
         temp = test_img_names[i] 
         test_img_names[i] = temp_graph_save_path + temp[util.find(temp,'/')[-1]:]
     
@@ -259,16 +249,16 @@ if __name__ == '__main__':
     
     network = vessel_segm_vgn(args, None)
 
-    config = tf.compat.v1.ConfigProto()
+    config = tf.ConfigProto()
     config.gpu_options.allow_growth = True  
-    sess = tf.compat.v1.InteractiveSession(config=config)
+    sess = tf.InteractiveSession(config=config)
     
-    saver = tf.compat.v1.train.Saver(max_to_keep=100)
-    summary_writer = tf.compat.v1.summary.FileWriter(model_save_path, sess.graph)
+    saver = tf.train.Saver(max_to_keep=100)
+    summary_writer = tf.summary.FileWriter(model_save_path, sess.graph)
     
-    sess.run(tf.compat.v1.global_variables_initializer())
+    sess.run(tf.global_variables_initializer())
     if args.pretrained_model is not None:
-        print("Loading model...")
+        print "Loading model..."
         ext_str = args.pretrained_model[args.pretrained_model.rfind('.')+1:]
         if ext_str=='ckpt':
             restore_from_pretrained_model(sess, saver, network, args.pretrained_model)
@@ -302,7 +292,7 @@ if __name__ == '__main__':
     graph_update_func_arg = []
     test_loss_logs = []
     print("Training the model...")
-    for iter in range(args.max_iters):
+    for iter in xrange(args.max_iters):
     
         timer.tic()
         
@@ -386,21 +376,21 @@ if __name__ == '__main__':
         train_infer_module_loss_list.append(infer_module_loss_val)
     
         if (iter+1) % (cfg.TRAIN.DISPLAY) == 0:
-            print('iter: %d / %d, loss: %.4f'\
-                    %(iter+1, args.max_iters, loss_val)) 
-            print('cnn_loss: %.4f, cnn_accuracy: %.4f, cnn_precision: %.4f, cnn_recall: %.4f'\
-                    %(cnn_loss_val, cnn_accuracy_val, cnn_precision_val, cnn_recall_val))
-            print('gnn_loss: %.4f, gnn_accuracy: %.4f'\
-                    %(gnn_loss_val, gnn_accuracy_val))
-            print('infer_module_loss: %.4f, infer_module_accuracy: %.4f, infer_module_precision: %.4f, infer_module_recall: %.4f'\
-                    %(infer_module_loss_val, infer_module_accuracy_val, infer_module_precision_val, infer_module_recall_val))
-            print('speed: {:.3f}s / iter'.format(timer.average_time))
+            print 'iter: %d / %d, loss: %.4f'\
+                    %(iter+1, args.max_iters, loss_val) 
+            print 'cnn_loss: %.4f, cnn_accuracy: %.4f, cnn_precision: %.4f, cnn_recall: %.4f'\
+                    %(cnn_loss_val, cnn_accuracy_val, cnn_precision_val, cnn_recall_val)
+            print 'gnn_loss: %.4f, gnn_accuracy: %.4f'\
+                    %(gnn_loss_val, gnn_accuracy_val)
+            print 'infer_module_loss: %.4f, infer_module_accuracy: %.4f, infer_module_precision: %.4f, infer_module_recall: %.4f'\
+                    %(infer_module_loss_val, infer_module_accuracy_val, infer_module_precision_val, infer_module_recall_val)
+            print 'speed: {:.3f}s / iter'.format(timer.average_time)
     
         if (iter+1) % cfg.TRAIN.SNAPSHOT_ITERS == 0:
             last_snapshot_iter = iter
             filename = os.path.join(model_save_path,('iter_{:d}'.format(iter+1) + '.ckpt'))
             saver.save(sess, filename)
-            print('Wrote snapshot to: {:s}'.format(filename))
+            print 'Wrote snapshot to: {:s}'.format(filename)
             
         if (iter+1)==next_update_start-1:
             data_layer_train.reinit(train_img_names, is_training=False, \
@@ -416,7 +406,7 @@ if __name__ == '__main__':
             cur_batch_size = len(img_list)
             reshaped_fg_prob_map = infer_module_fg_prob_mat.reshape((cur_batch_size,infer_module_fg_prob_mat.shape[1],infer_module_fg_prob_mat.shape[2]))
             
-            for j in range(cur_batch_size):
+            for j in xrange(cur_batch_size):
                 graph_update_func_arg.append((img_list[j], reshaped_fg_prob_map[j,:,:], temp_graph_save_path, args))
 
         if (iter+1)==next_update_end:
@@ -446,7 +436,7 @@ if __name__ == '__main__':
             # inference module related
             all_infer_module_preds = np.zeros((0,))
 
-            for _ in range(int(np.ceil(float(len_test)/cfg.TRAIN.GRAPH_BATCH_SIZE))):
+            for _ in xrange(int(np.ceil(float(len_test)/cfg.TRAIN.GRAPH_BATCH_SIZE))):
                                 
                 # get one batch
                 img_list, blobs_test = data_layer_test.forward()
@@ -510,18 +500,18 @@ if __name__ == '__main__':
                 cur_batch_size = len(img_list)
                 reshaped_cnn_fg_prob_map = cnn_fg_prob_mat.reshape((cur_batch_size,cnn_fg_prob_mat.shape[1],cnn_fg_prob_mat.shape[2]))
                 reshaped_infer_module_fg_prob_mat = infer_module_fg_prob_mat.reshape((cur_batch_size,infer_module_fg_prob_mat.shape[1],infer_module_fg_prob_mat.shape[2]))
-                for j in range(cur_batch_size):
+                for j in xrange(cur_batch_size):
                     cur_img_name = img_list[j]
                     cur_img_name = cur_img_name[util.find(cur_img_name,'/')[-1]:]
                     
                     cur_cnn_fg_prob_map = reshaped_cnn_fg_prob_map[j,:,:]
                     cur_infer_module_fg_prob_map = reshaped_infer_module_fg_prob_mat[j,:,:]
                 
-                    cur_map = (cur_cnn_fg_prob_map*255).astype(np.uint8)
+                    cur_map = (cur_cnn_fg_prob_map*255).astype(int)
                     cur_save_path = res_save_path + cur_img_name + '_prob_cnn.png'
                     skimage.io.imsave(cur_save_path, cur_map)
                     
-                    cur_map = (cur_infer_module_fg_prob_map*255).astype(np.uint8)
+                    cur_map = (cur_infer_module_fg_prob_map*255).astype(int)
                     cur_save_path = res_save_path + cur_img_name + '_prob_infer_module.png'
                     skimage.io.imsave(cur_save_path, cur_map)
             
@@ -542,7 +532,7 @@ if __name__ == '__main__':
             all_infer_module_correct = all_cnn_labels_bin==all_infer_module_preds_bin
             infer_module_acc_test = np.mean(all_infer_module_correct.astype(np.float32))
 
-            summary = tf.compat.v1.Summary()
+            summary = tf.Summary()
             summary.value.add(tag="train_loss", simple_value=float(np.mean(train_loss_list)))
             summary.value.add(tag="train_cnn_loss", simple_value=float(np.mean(train_cnn_loss_list)))
             summary.value.add(tag="train_gnn_loss", simple_value=float(np.mean(train_gnn_loss_list)))
@@ -564,14 +554,14 @@ if __name__ == '__main__':
             summary_writer.add_summary(summary, global_step=iter+1)
             summary_writer.flush()
             
-            print('iter: %d / %d, train_loss: %.4f, train_cnn_loss: %.4f, train_gnn_loss: %.4f, train_infer_module_loss: %.4f'\
-                %(iter+1, args.max_iters, np.mean(train_loss_list), np.mean(train_cnn_loss_list), np.mean(train_gnn_loss_list), np.mean(train_infer_module_loss_list)))
-            print('iter: %d / %d, test_loss: %.4f, test_cnn_loss: %.4f, test_gnn_loss: %.4f, test_infer_module_loss: %.4f'\
-                %(iter+1, args.max_iters, np.mean(test_loss_list), np.mean(test_cnn_loss_list), np.mean(test_gnn_loss_list), np.mean(test_infer_module_loss_list)))
-            print('test_cnn_acc: %.4f, test_cnn_auc: %.4f, test_cnn_ap: %.4f'%(cnn_acc_test, cnn_auc_test, cnn_ap_test))
-            print('test_gnn_acc: %.4f, test_gnn_auc: %.4f, test_gnn_ap: %.4f'%(gnn_acc_test, gnn_auc_test, gnn_ap_test))
-            print('test_infer_module_acc: %.4f, test_infer_module_auc: %.4f, test_infer_module_ap: %.4f'%(infer_module_acc_test, infer_module_auc_test, infer_module_ap_test))
-            print('lr: %.8f'%(cur_lr))
+            print 'iter: %d / %d, train_loss: %.4f, train_cnn_loss: %.4f, train_gnn_loss: %.4f, train_infer_module_loss: %.4f'\
+                %(iter+1, args.max_iters, np.mean(train_loss_list), np.mean(train_cnn_loss_list), np.mean(train_gnn_loss_list), np.mean(train_infer_module_loss_list))
+            print 'iter: %d / %d, test_loss: %.4f, test_cnn_loss: %.4f, test_gnn_loss: %.4f, test_infer_module_loss: %.4f'\
+                %(iter+1, args.max_iters, np.mean(test_loss_list), np.mean(test_cnn_loss_list), np.mean(test_gnn_loss_list), np.mean(test_infer_module_loss_list))
+            print 'test_cnn_acc: %.4f, test_cnn_auc: %.4f, test_cnn_ap: %.4f'%(cnn_acc_test, cnn_auc_test, cnn_ap_test)
+            print 'test_gnn_acc: %.4f, test_gnn_auc: %.4f, test_gnn_ap: %.4f'%(gnn_acc_test, gnn_auc_test, gnn_ap_test)
+            print 'test_infer_module_acc: %.4f, test_infer_module_auc: %.4f, test_infer_module_ap: %.4f'%(infer_module_acc_test, infer_module_auc_test, infer_module_ap_test)
+            print 'lr: %.8f'%(cur_lr)
             
             f_log.write('iter: '+str(iter+1)+' / '+str(args.max_iters)+'\n')
             f_log.write('train_loss '+str(np.mean(train_loss_list))+'\n')
@@ -620,7 +610,7 @@ if __name__ == '__main__':
     if last_snapshot_iter != iter:
         filename = os.path.join(model_save_path,('iter_{:d}'.format(iter+1) + '.ckpt'))
         saver.save(sess, filename)
-        print('Wrote snapshot to: {:s}'.format(filename))
+        print 'Wrote snapshot to: {:s}'.format(filename)
     
     f_log.close()
     sess.close()

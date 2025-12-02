@@ -1,12 +1,9 @@
-# coded by syshin
-
 import numpy as np
 import os
 import pdb
 import skimage.io
 import argparse
 import tensorflow as tf
-tf.compat.v1.disable_eager_execution()
 
 from config import cfg
 from model import vessel_segm_cnn
@@ -69,13 +66,18 @@ if __name__ == '__main__':
     
     network = vessel_segm_cnn(args, None)
 
-    config = tf.compat.v1.ConfigProto()
+    config = tf.ConfigProto()
     config.gpu_options.allow_growth = True    
-    sess = tf.compat.v1.InteractiveSession(config=config)
-    # saver = tf.compat.v1.train.Saver()  
-    variables_to_restore = tf.compat.v1.trainable_variables()
-    saver = tf.compat.v1.train.Saver(var_list=variables_to_restore)
-    sess.run(tf.compat.v1.global_variables_initializer())
+    sess = tf.InteractiveSession(config=config)
+    saver = tf.train.Saver()  
+
+    sess.run(tf.global_variables_initializer())
+    
+    assert args.model_path, 'Model path is not available'  
+    print "Loading model..."
+    variables_to_restore = tf.trainable_variables()
+    saver = tf.train.Saver(var_list=variables_to_restore)
+    sess.run(tf.global_variables_initializer())
     
     assert args.model_path, 'Model path is not available'  
     print("Loading model...")
@@ -86,7 +88,7 @@ if __name__ == '__main__':
     timer = util.Timer()
     
     train_loss_list = []
-    for _ in range(int(np.ceil(float(len_train)/cfg.TRAIN.BATCH_SIZE))):
+    for _ in xrange(int(np.ceil(float(len_train)/cfg.TRAIN.BATCH_SIZE))):
                 
         timer.tic()
         
@@ -126,12 +128,12 @@ if __name__ == '__main__':
             mask = ((mask.astype(float)/255)>=0.5).astype(float)
             reshaped_fg_prob_map = reshaped_fg_prob_map*mask
         reshaped_output = reshaped_fg_prob_map>=0.5    
-        for img_idx in range(cur_batch_size):
+        for img_idx in xrange(cur_batch_size):
             cur_test_img_path = img_list[img_idx]
             temp_name = cur_test_img_path[util.find(cur_test_img_path,'/')[-1]+1:]
 
-            cur_reshaped_fg_prob_map = (reshaped_fg_prob_map[img_idx,:,:]*255).astype(np.uint8)
-            cur_reshaped_output = (reshaped_output[img_idx,:,:].astype(np.uint8))*255
+            cur_reshaped_fg_prob_map = (reshaped_fg_prob_map[img_idx,:,:]*255).astype(int)
+            cur_reshaped_output = reshaped_output[img_idx,:,:].astype(int)*255
 
             cur_fg_prob_save_path = os.path.join(res_save_path, temp_name + '_prob.png')
             cur_output_save_path = os.path.join(res_save_path, temp_name + '_output.png')
@@ -144,7 +146,7 @@ if __name__ == '__main__':
     all_cnn_preds = np.zeros((0,))
     all_cnn_labels_roi = np.zeros((0,))
     all_cnn_preds_roi = np.zeros((0,))
-    for _ in range(int(np.ceil(float(len_test)/cfg.TRAIN.BATCH_SIZE))):
+    for _ in xrange(int(np.ceil(float(len_test)/cfg.TRAIN.BATCH_SIZE))):
                 
         timer.tic()
         
@@ -197,13 +199,13 @@ if __name__ == '__main__':
             label = np.squeeze(label.astype(float), axis=-1)
 
         reshaped_output = reshaped_fg_prob_map>=0.5
-        for img_idx in range(cur_batch_size):
+        for img_idx in xrange(cur_batch_size):
             cur_test_img_path = img_list[img_idx]
             temp_name = cur_test_img_path[util.find(cur_test_img_path,'/')[-1]+1:]
             
-            cur_reshaped_fg_prob_map = (reshaped_fg_prob_map[img_idx,:,:]*255).astype(np.uint8)
-            cur_reshaped_fg_prob_map_inv = ((1.-reshaped_fg_prob_map[img_idx,:,:])*255).astype(np.uint8)
-            cur_reshaped_output = (reshaped_output[img_idx,:,:].astype(np.uint8))*255
+            cur_reshaped_fg_prob_map = (reshaped_fg_prob_map[img_idx,:,:]*255).astype(int)
+            cur_reshaped_fg_prob_map_inv = ((1.-reshaped_fg_prob_map[img_idx,:,:])*255).astype(int)
+            cur_reshaped_output = reshaped_output[img_idx,:,:].astype(int)*255
 
             cur_fg_prob_save_path = os.path.join(res_save_path, temp_name + '_prob.png')
             cur_fg_prob_inv_save_path = os.path.join(res_save_path, temp_name + '_prob_inv.png')
@@ -229,10 +231,10 @@ if __name__ == '__main__':
         cnn_acc_test_roi = np.mean(all_cnn_correct_roi.astype(np.float32))
     
     #print 'train_loss: %.4f'%(np.mean(train_loss_list))
-    print ('test_loss: %.4f'%(np.mean(test_loss_list)))
-    print ('test_cnn_acc: %.4f, test_cnn_auc: %.4f, test_cnn_ap: %.4f'%(cnn_acc_test, cnn_auc_test, cnn_ap_test))
+    print 'test_loss: %.4f'%(np.mean(test_loss_list))
+    print 'test_cnn_acc: %.4f, test_cnn_auc: %.4f, test_cnn_ap: %.4f'%(cnn_acc_test, cnn_auc_test, cnn_ap_test)
     if args.dataset=='DRIVE':
-        print ('test_cnn_acc_roi: %.4f, test_cnn_auc_roi: %.4f, test_cnn_ap_roi: %.4f'%(cnn_acc_test_roi, cnn_auc_test_roi, cnn_ap_test_roi))
+        print 'test_cnn_acc_roi: %.4f, test_cnn_auc_roi: %.4f, test_cnn_ap_roi: %.4f'%(cnn_acc_test_roi, cnn_auc_test_roi, cnn_ap_test_roi)
     
     #f_log.write('train_loss '+str(np.mean(train_loss_list))+'\n')
     f_log.write('test_loss '+str(np.mean(test_loss_list))+'\n')
@@ -246,7 +248,7 @@ if __name__ == '__main__':
 
     f_log.flush()
     
-    print ('speed: {:.3f}s'.format(timer.average_time))
+    print 'speed: {:.3f}s'.format(timer.average_time)
     
     f_log.close()
     sess.close()
